@@ -145,8 +145,6 @@ def get_users() -> List[Dict[str, Any]]:
 def upsert_user_row(chat_id: int, name: str = None, deposit: float = None,
                     active: bool = None, pending: float = None):
     w = ws(USERS_SHEET)
-
-    # Надёжный поиск: пробуем .find, если нет — сканируем колонку A
     row_idx = None
     try:
         cell = w.find(str(chat_id), in_column=1)
@@ -154,7 +152,6 @@ def upsert_user_row(chat_id: int, name: str = None, deposit: float = None,
             row_idx = cell.row
     except Exception as e:
         log.info(f"find() failed or not supported fully, fallback to scan: {e}")
-
     if row_idx is None:
         try:
             col = w.col_values(1)
@@ -164,27 +161,16 @@ def upsert_user_row(chat_id: int, name: str = None, deposit: float = None,
                     break
         except Exception as e:
             log.warning(f"col_values scan failed: {e}")
-
-    def v(new_val, current):
-        return current if new_val is None else new_val
-
+    def v(new_val, current): return current if new_val is None else new_val
     if row_idx:
         current = w.row_values(row_idx)
-        while len(current) < 5:
-            current.append("")
-        new_name    = v(name, current[1])
-        new_deposit = str(v(deposit, to_float(current[2])))
+        while len(current) < 5: current.append("")
+        new_name, new_deposit = v(name, current[1]), str(v(deposit, to_float(current[2])))
         new_active  = "TRUE" if active else "FALSE" if active is not None else current[3]
         new_pending = str(pending) if pending is not None else str(to_float(current[4]))
-
-        row = [str(chat_id), new_name, new_deposit, new_active, new_pending]
-        w.update(f"A{row_idx}:E{row_idx}", [row])
+        w.update(f"A{row_idx}:E{row_idx}", [[str(chat_id), new_name, new_deposit, new_active, new_pending]])
     else:
-        w.append_row(
-            [str(chat_id), name or "", str(deposit or 0),
-             "TRUE" if (active is None or active) else "FALSE", str(pending or 0)],
-            value_input_option="RAW"
-        )
+        w.append_row([str(chat_id), name or "", str(deposit or 0), "TRUE" if (active is None or active) else "FALSE", str(pending or 0)], value_input_option="RAW")
 
 # ------------------- Helpers -------------------
 def fmt_usd(x): return f"{x:,.2f}".replace(",", " ")
@@ -201,14 +187,6 @@ def base_from_pair(pair: str) -> str:
 
 def parse_money(s: str) -> float:
     return float(re.sub(r"[^\d.,\-]", "", s).replace(",", "."))
-
-def parse_adduser_text(text: str):
-    m = re.match(r"^/adduser\s+(-?\d+)\s+(.+)\s+([0-9][\d\s.,]*)\s*$", text.strip(), re.I)
-    if not m: return None
-    chat_id = int(m.group(1))
-    deposit = parse_money(m.group(3))
-    name = m.group(2).strip().strip('"\'')
-    return chat_id, name, deposit
 
 def parse_setdep_text(text: str):
     m = re.match(r"^/setdep\s+(-?\d+)\s+([0-9][\d\s.,]*)\s*$", text.strip(), re.I)
@@ -249,27 +227,30 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Команды управления доступны только админу.")
     text = (
         "Админ-команды:\n"
-        "/adduser chat_id Имя депозит\n"
-        "/setdep chat_id депозит (со следующей сделкой)\n"
-        "/setname chat_id Имя\n"
-        "/remove chat_id\n"
+        "/adduser <chat_id> <Имя (можно с пробелами)> <депозит>\n"
+        "/setdep <chat_id> <депозит> (со следующей сделкой)\n"
+        "/setname <chat_id> <Имя>\n"
+        "/remove <chat_id>\n"
         "/list"
     )
     await update.message.reply_text(text)
 
 async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    parsed = parse_adduser_text(update.message.text or "")
-    if not parsed:
-        return await update.message.reply_text("Использование: /adduser <chat_id> <Имя> <депозит>")
-    chat_id, name, dep = parsed
+    try:
+        args = ctx.args
+        if len(args) < 3: raise ValueError
+        chat_id, dep = int(args[0]), float(args[-1])
+        name = " ".join(args[1:-1]).strip() or str(chat_id)
+    except (ValueError, IndexError):
+        return await update.message.reply_text("Использование: /adduser <chat_id> <Имя (можно с пробелами)> <депозит>")
     upsert_user_row(chat_id, name=name, deposit=dep, active=True)
     await update.message.reply_text(f"OK. Пользователь {name} ({chat_id}) добавлен с депозитом {fmt_usd(dep)} USDT.")
     await set_menu_user(ctx.application, chat_id)
     try:
         await ctx.application.bot.send_message(
             chat_id=chat_id,
-            text=f"👋 Добро пожаловать! Поздравляем, вы начали зарабатывать! Ваш депозит: ${fmt_usd(dep)}.",
+            text=f"👋 Добро пожаловать, <b>{name}</b>! Поздравляем, вы начали зарабатывать! Ваш депозит: ${fmt_usd(dep)}.",
             parse_mode=constants.ParseMode.HTML
         )
     except Exception as e:
@@ -355,30 +336,50 @@ async def poll_and_broadcast(app: Application):
         for rec in new_records:
             ev, sid = rec.get("Event") or "", rec.get("Signal_ID") or ""
             cum_margin, pnl_usd = to_float(rec.get("Cum_Margin_USDT")), to_float(rec.get("PNL_Realized_USDT"))
-            if ev in ("OPEN", "ADD", "RETEST_ADD"):
-                if ev == "OPEN":
-                    for u in users:
-                        if u["pending"] > 0:
-                            upsert_user_row(u["chat_id"], deposit=u["pending"], pending=0)
-                            u["deposit"], u["pending"] = u["pending"], 0
-                open_positions[sid] = {"cum_margin": cum_margin}
+            
+            if ev == "OPEN":
+                for u in users:
+                    if u["pending"] > 0:
+                        upsert_user_row(u["chat_id"], deposit=u["pending"], pending=0)
+                        u["deposit"], u["pending"] = u["pending"], 0
+                aud = {u["chat_id"] for u in users}
+                open_positions[sid] = {"cum_margin": cum_margin, "aud": aud}
                 used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
-                if ev == "OPEN": broadcast_general.append(f"📊 Сделка открыта. Задействовано {used_pct:.1f}% банка ({fmt_usd(cum_margin)}).")
-                else: broadcast_general.append(f"🪙💵 Докупили {base_from_pair(rec.get('Pair', ''))}. Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)}).")
-            if ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
-                cm = open_positions.get(sid, {}).get("cum_margin", cum_margin)
+                broadcast_general.append(f"📊 Сделка открыта. Задействовано {used_pct:.1f}% банка ({fmt_usd(cum_margin)}).")
+            
+            elif ev in ("ADD", "RETEST_ADD"):
+                base, aud = base_from_pair(rec.get("Pair", "")), open_positions.get(sid, {}).get("aud", set())
+                used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
+                msg = f"🪙💵 Докупили {base}. Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
+                for chat_id in aud:
+                    chunk = personal_texts.get(chat_id, "")
+                    personal_texts[chat_id] = (chunk + ("\n\n" if chunk else "") + msg)
+
+            elif ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
+                cm, aud = open_positions.get(sid, {}).get("cum_margin", cum_margin), open_positions.get(sid, {}).get("aud", set())
                 profit_pct = (pnl_usd / max(cm, 1e-9)) * 100.0 if cm > 0 else 0.0
                 profit_total += pnl_usd
                 for u in users:
+                    if u["chat_id"] not in aud: continue
                     ann_pct, ann_usd = annual_forecast(profit_total, start_utc, u["deposit"])
                     personal_texts[u['chat_id']] = (f"{tier_emoji(profit_pct) if pnl_usd >= 0 else '🛑'} Сделка закрыта. Использовалось {100. * cm / max(SYSTEM_BANK_USDT, 1e-9):.1f}% банка ({fmt_usd(cm)}). "
                                                     f"P&L: {fmt_usd(pnl_usd)} ({profit_pct:+.2f}%).\n"
                                                     f"Оценка годовых по депозиту {fmt_usd(u['deposit'])}: ~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год).")
                 if sid in open_positions: del open_positions[sid]
-        final_messages, general_text = {}, "\n\n".join(broadcast_general)
+        
+        # Сборка и отправка сообщений
+        final_messages = {}
+        # Сначала общие сообщения для аудитории OPEN
+        general_text = "\n\n".join(broadcast_general)
+        open_aud = {cid for pos in open_positions.values() for cid in pos.get("aud", set()) if broadcast_general}
+        for chat_id in open_aud:
+            final_messages[chat_id] = general_text
+        # Затем добавляем персональные (ADD/CLOSE)
         for chat_id, personal_msg in personal_texts.items():
-            full_msg = (general_text + ("\n\n" + personal_msg if personal_msg else "")).strip()
-            if full_msg: final_messages[chat_id] = full_msg
+            if not personal_msg: continue
+            existing = final_messages.get(chat_id, "")
+            final_messages[chat_id] = (existing + ("\n\n" if existing else "") + personal_msg)
+
         if final_messages: await send_all(app, final_messages)
         set_state(last_row=total_rows_in_sheet, profit_total=profit_total)
     except Exception as e: log.exception("poll_and_broadcast error")
