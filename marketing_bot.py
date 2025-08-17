@@ -1,5 +1,5 @@
 # marketing_bot.py — STRIGI_KAPUSTU_BOT
-import os, time, logging, math
+import os, time, logging, math, re, json
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
@@ -15,7 +15,28 @@ from telegram.ext import (
 BOT_NAME = "STRIGI_KAPUSTU_BOT"
 BOT_TOKEN = os.getenv("MARKETING_BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.isdigit()}
+
+def parse_admin_ids(raw: str) -> set[int]:
+    if not raw:
+        return set()
+    # 1) сначала пробуем как JSON
+    try:
+        maybe = json.loads(raw)
+        if isinstance(maybe, (list, tuple, set)):
+            return {int(x) for x in maybe}
+        if isinstance(maybe, (int, str)) and str(maybe).lstrip("-").isdigit():
+            return {int(maybe)}
+    except Exception:
+        pass
+    # 2) универсальный парсер по разделителям
+    out = set()
+    for t in re.split(r'[\s,;]+', raw.strip()):
+        t = t.strip().strip('[](){}"\'')
+        if t and (t.lstrip("-").isdigit()):
+            out.add(int(t))
+    return out
+
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 SYSTEM_BANK_USDT = float(os.getenv("SYSTEM_BANK_USDT", "1000"))  # % от банка считаем пока от этой величины
 
 if not BOT_TOKEN or not SHEET_ID or not ADMIN_IDS:
@@ -25,13 +46,18 @@ if not BOT_TOKEN or not SHEET_ID or not ADMIN_IDS:
 log = logging.getLogger("marketing")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+log.info(f"ADMIN_IDS raw={os.getenv('ADMIN_IDS')}")
+log.info(f"ADMIN_IDS parsed={sorted(ADMIN_IDS)}")
+
+
 # ------------------- Sheets -------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 if not CREDS_JSON:
     raise RuntimeError("GOOGLE_CREDENTIALS env var not set")
 
-gc = gspread.service_account_from_dict(eval(CREDS_JSON))
+# ИСПРАВЛЕНО: безопасное использование json.loads вместо eval
+gc = gspread.service_account_from_dict(json.loads(CREDS_JSON))
 sh = gc.open_by_key(SHEET_ID)
 
 # Названия листов
@@ -51,7 +77,6 @@ def ensure_sheets():
     if STATE_SHEET not in names:
         ws = sh.add_worksheet(STATE_SHEET, rows=10, cols=3)
         ws.update("A1:C1", [["Last_Row", "Start_UTC", "Profit_Total_USDT"]])
-        # Все значения теперь в одной строке
         ws.update("A2:C2", [["0", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "0"]])
     if LOG_SHEET not in names:
         raise RuntimeError(f"Не найден лист {LOG_SHEET} (его пишет основной бот)")
@@ -63,7 +88,6 @@ def ws(title): return sh.worksheet(title)
 # ------------------- Model -------------------
 def get_state():
     w = ws(STATE_SHEET)
-    # Читаем значения из конкретных ячеек для надежности
     val_last_row = w.acell("A2").value
     val_start_utc = w.acell("B2").value
     val_profit_total = w.acell("C2").value
@@ -76,7 +100,6 @@ def get_state():
 
 def set_state(last_row: Optional[int] = None, profit_total: Optional[float] = None):
     w = ws(STATE_SHEET)
-    # Используем update_acell для атомарной и точной записи
     if last_row is not None:
         w.update_acell("A2", str(last_row))
     if profit_total is not None:
@@ -111,7 +134,6 @@ def upsert_user_row(chat_id: int, name: str = None, deposit: float = None, activ
         return cur if key is None else key
 
     if row_idx:
-        # Получаем текущие значения, чтобы не затереть их
         current_values = w.row_values(row_idx)
         while len(current_values) < 5: current_values.append("")
 
@@ -143,7 +165,11 @@ def tier_emoji(profit_pct_of_margin: float) -> str:
     if profit_pct_of_margin >= 50: return "🏍️"
     return "✅"
 
-# хранить состояние позиций, чтобы знать текущую задействованную маржу по signal_id
+def base_from_pair(pair: str) -> str:
+    """EURC/USDT:USDT -> EUR (косметика: срезаем завершающую C у стейблов EURC/USDC и т.п.)"""
+    base = (pair or "").split("/")[0].split(":")[0].upper()
+    return base[:-1] if base.endswith("C") and len(base) > 3 else base
+
 open_positions: Dict[str, Dict[str, Any]] = {}
 
 def annual_forecast(profit_total_usdt: float, start_utc: str, deposit: float) -> (float, float):
@@ -153,7 +179,7 @@ def annual_forecast(profit_total_usdt: float, start_utc: str, deposit: float) ->
         start_dt = datetime.now(timezone.utc) - timedelta(days=1)
     
     days_passed = (datetime.now(timezone.utc) - start_dt).total_seconds() / (24 * 3600)
-    days = max(days_passed, 1) # Чтобы избежать деления на ноль, если бот только запущен
+    days = max(days_passed, 1)
     
     if deposit <= 0: return 0.0, 0.0
     
@@ -162,18 +188,27 @@ def annual_forecast(profit_total_usdt: float, start_utc: str, deposit: float) ->
     return annual_pct, annual_usd
 
 # ------------------- Telegram -------------------
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    cid = update.effective_chat.id if update.effective_chat else None
+    return (uid in ADMIN_IDS) or (cid in ADMIN_IDS)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     cid = update.effective_chat.id
     txt = (f"Привет! Я <b>{BOT_NAME}</b>.\n"
-           f"Твой <b>chat_id</b>: <code>{cid}</code>.\n"
+           f"Твой <b>user_id</b>: <code>{uid}</code>\n"
+           f"Твой <b>chat_id</b>: <code>{cid}</code>\n"
            f"Подписку и депозит назначает админ.")
     await update.message.reply_text(txt, parse_mode=constants.ParseMode.HTML)
 
+async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    cid = update.effective_chat.id
+    await update.message.reply_text(f"user_id={uid}\nchat_id={cid}\nadmin={is_admin(update)}")
+
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update):
         return await update.message.reply_text("Команды управления доступны только админу.")
     await update.message.reply_text(
         "/adduser <chat_id> <Имя> <депозит>\n"
@@ -185,8 +220,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    if not is_admin(update): return
     try:
         chat_id = int(ctx.args[0]); name = ctx.args[1]; dep = float(ctx.args[2])
     except (IndexError, ValueError):
@@ -195,18 +229,16 @@ async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"OK. Пользователь {name} ({chat_id}) добавлен с депозитом {fmt_usd(dep)} USDT.")
 
 async def setdep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    if not is_admin(update): return
     try:
         chat_id = int(ctx.args[0]); dep = float(ctx.args[1])
     except (IndexError, ValueError):
         return await update.message.reply_text("Использование: /setdep <chat_id> <депозит>")
-    # откладываем применение до следующего OPEN
     upsert_user_row(chat_id, pending=dep)
     await update.message.reply_text(f"OK. Pending-депозит {fmt_usd(dep)} USDT применится со следующей сделкой.")
 
 async def setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update): return
     try:
         chat_id = int(ctx.args[0]); name = " ".join(ctx.args[1:])
     except (IndexError, ValueError):
@@ -215,7 +247,7 @@ async def setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("OK. Имя обновлено.")
 
 async def remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update): return
     try:
         chat_id = int(ctx.args[0])
     except (IndexError, ValueError):
@@ -224,7 +256,7 @@ async def remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("OK. Пользователь деактивирован.")
 
 async def list_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update): return
     users = get_users()
     if not users: return await update.message.reply_text("Список пуст.")
     lines = []
@@ -242,8 +274,8 @@ async def send_all(app: Application, text_by_user: Dict[int, str]):
             log.warning(f"send to {chat_id} failed: {e}")
 
 # ------------------- Poller -------------------
-def sheet_dicts(ws) -> List[Dict[str, Any]]:
-    vals = ws.get_all_values()
+def sheet_dicts(worksheet) -> List[Dict[str, Any]]:
+    vals = worksheet.get_all_values()
     if not vals or len(vals) < 2: return []
     headers = vals[0]
     out = []
@@ -256,12 +288,18 @@ async def poll_and_broadcast(app: Application):
     try:
         last_row, start_utc, profit_total = get_state()
         records = sheet_dicts(ws(LOG_SHEET))
-        total_rows_in_sheet = len(records) + 1  # + header row
+        total_rows_in_sheet = len(records) + 1
         
-        if total_rows_in_sheet <= last_row:
-            return  # нет новых событий
+        # ИСПРАВЛЕНО: защита от "заливки" истории при первом запуске
+        if last_row == 0:
+            log.info(f"First run detected. Skipping {total_rows_in_sheet} historical records.")
+            set_state(last_row=total_rows_in_sheet, profit_total=0.0)
+            return
 
-        new_records = records[(last_row - 1):] if last_row > 1 else records
+        if total_rows_in_sheet <= last_row:
+            return
+
+        new_records = records[(last_row - 1):]
         users = [u for u in get_users() if u["active"]]
         if not users:
             set_state(last_row=total_rows_in_sheet)
@@ -273,10 +311,7 @@ async def poll_and_broadcast(app: Application):
         for rec in new_records:
             ev = rec.get("Event") or ""
             sid = rec.get("Signal_ID") or ""
-            step = int(rec.get("Step_No") or 0)
             cum_margin = to_float(rec.get("Cum_Margin_USDT"))
-            entry_price = rec.get("Entry_Price") or ""
-            side = rec.get("Side") or ""
             pnl_usd = to_float(rec.get("PNL_Realized_USDT"))
             
             if ev in ("OPEN", "ADD", "RETEST_ADD"):
@@ -286,24 +321,24 @@ async def poll_and_broadcast(app: Application):
                             upsert_user_row(u["chat_id"], deposit=u["pending"], pending=0)
                             u["deposit"] = u["pending"]
                             u["pending"] = 0
-                
+
                 open_positions[sid] = {"cum_margin": cum_margin}
                 used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
-                
+
                 if ev == "OPEN":
                     broadcast_general.append(
-                        f"🎯 <b>Открыли сделку</b> ({side})\n"
-                        f"Задействовано: <b>{fmt_pct(used_pct)}</b> от банка ({fmt_usd(cum_margin)} USDT)\n"
-                        f"Цена входа: <code>{entry_price}</code>"
+                        f"📊 Сделка открыта. "
+                        f"Задействовано {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
                     )
                 else:
+                    base = base_from_pair(rec.get("Pair", ""))
                     broadcast_general.append(
-                        f"➕ <b>Усреднение #{max(step-1, 0)}</b>\n"
-                        f"Объём в сделке: <b>{fmt_pct(used_pct)}</b> от банка ({fmt_usd(cum_margin)} USDT)"
+                        f"🪙💵 Докупили {base}. "
+                        f"Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
                     )
 
             if ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
-                cm = open_positions.get(sid, {}).get("cum_margin", cum_margin) # Fallback to current row margin
+                cm = open_positions.get(sid, {}).get("cum_margin", cum_margin)
                 used_pct = 100.0 * (cm / max(SYSTEM_BANK_USDT, 1e-9))
                 profit_pct_of_margin = (pnl_usd / max(cm, 1e-9)) * 100.0 if cm > 0 else 0.0
                 icon = tier_emoji(profit_pct_of_margin) if pnl_usd >= 0 else "🛑"
@@ -313,31 +348,28 @@ async def poll_and_broadcast(app: Application):
                 for u in users:
                     ann_pct, ann_usd = annual_forecast(profit_total, start_utc, u["deposit"])
                     txt = (
-                        f"{icon} <b>Сделка закрыта</b> ({'прибыль' if pnl_usd>=0 else 'убыток'})\n"
-                        f"Задействовано: <b>{fmt_pct(used_pct)}</b> от банка ({fmt_usd(cm)} USDT)\n"
-                        f"Результат: <b>{fmt_usd(pnl_usd)} USDT</b> ({fmt_pct(profit_pct_of_margin)} от задейств.)\n\n"
-                        f"Прогноз на год для твоего депозита {fmt_usd(u['deposit'])} USDT:\n"
-                        f"≈ <b>{fmt_pct(ann_pct)}</b> / <b>{fmt_usd(ann_usd)} USDT</b>"
+                        f"{icon} Сделка закрыта. "
+                        f"Использовалось {used_pct:.1f}% банка ({fmt_usd(cm)}). "
+                        f"P&L: {fmt_usd(pnl_usd)} ({profit_pct_of_margin:+.2f}%).\n"
+                        f"Оценка годовых по депозиту {fmt_usd(u['deposit'])}: "
+                        f"~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год)."
                     )
-                    personal_texts[u["chat_id"]] = txt
+                    personal_texts[u['chat_id']] = txt
 
                 if sid in open_positions:
                     del open_positions[sid]
         
-        # Собираем и отправляем сообщения
         final_messages = {}
         general_text = "\n\n".join(broadcast_general)
         
         for chat_id, personal_msg in personal_texts.items():
             full_msg = ""
-            if general_text:
-                full_msg += general_text
+            if general_text: full_msg += general_text
             if personal_msg:
                 if full_msg: full_msg += "\n\n"
                 full_msg += personal_msg
             
-            if full_msg:
-                final_messages[chat_id] = full_msg
+            if full_msg: final_messages[chat_id] = full_msg
 
         if final_messages:
             await send_all(app, final_messages)
@@ -347,12 +379,17 @@ async def poll_and_broadcast(app: Application):
     except Exception as e:
         log.exception("poll_and_broadcast error")
 
+# ИСПРАВЛЕНО: async-колбэк для JobQueue
+async def poll_job(context: ContextTypes.DEFAULT_TYPE):
+    await poll_and_broadcast(context.application)
+
 # ------------------- Main -------------------
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Показать chat_id и помощь"),
         BotCommand("help", "Команды админа"),
-        BotCommand("list", "Список пользователей (админ)")
+        BotCommand("list", "Список пользователей (админ)"),
+        BotCommand("whoami", "Проверить свой ID и статус")
     ])
 
 def main():
@@ -360,14 +397,15 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("adduser", adduser))
     app.add_handler(CommandHandler("setdep", setdep))
     app.add_handler(CommandHandler("setname", setname))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("list", list_users))
 
-    # Пуллер каждые 10 сек
-    app.job_queue.run_repeating(lambda ctx: poll_and_broadcast(app), interval=10, first=5)
+    # ИСПРАВЛЕНО: передача async-колбэка в run_repeating
+    app.job_queue.run_repeating(poll_job, interval=10, first=5)
 
     log.info(f"{BOT_NAME} starting…")
     app.run_polling()
