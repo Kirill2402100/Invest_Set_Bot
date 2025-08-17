@@ -47,6 +47,7 @@ if not BOT_TOKEN or not SHEET_ID or not ADMIN_IDS:
 log = logging.getLogger("marketing")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+log.info(f"gspread version: {getattr(gspread, '__version__', 'unknown')}")
 log.info(f"ADMIN_IDS raw={os.getenv('ADMIN_IDS')}")
 log.info(f"ADMIN_IDS parsed={sorted(ADMIN_IDS)}")
 
@@ -141,21 +142,49 @@ def get_users() -> List[Dict[str, Any]]:
             log.warning(f"Skipping invalid user row: {r}")
     return res
 
-def upsert_user_row(chat_id: int, name: str = None, deposit: float = None, active: bool = None, pending: float = None):
+def upsert_user_row(chat_id: int, name: str = None, deposit: float = None,
+                    active: bool = None, pending: float = None):
     w = ws(USERS_SHEET)
-    try: cell = w.find(str(chat_id), in_column=1); row_idx = cell.row
-    except gspread.exceptions.CellNotFound: row_idx = None
-    def v(key, cur): return cur if key is None else key
+
+    # Надёжный поиск: пробуем .find, если нет — сканируем колонку A
+    row_idx = None
+    try:
+        cell = w.find(str(chat_id), in_column=1)
+        if cell is not None and getattr(cell, "row", None):
+            row_idx = cell.row
+    except Exception as e:
+        log.info(f"find() failed or not supported fully, fallback to scan: {e}")
+
+    if row_idx is None:
+        try:
+            col = w.col_values(1)
+            for i, v in enumerate(col, start=1):
+                if str(v).strip() == str(chat_id):
+                    row_idx = i
+                    break
+        except Exception as e:
+            log.warning(f"col_values scan failed: {e}")
+
+    def v(new_val, current):
+        return current if new_val is None else new_val
+
     if row_idx:
-        current_values = w.row_values(row_idx)
-        while len(current_values) < 5: current_values.append("")
-        new_name = v(name, current_values[1])
-        new_deposit = str(v(deposit, to_float(current_values[2])))
-        new_active = "TRUE" if active else "FALSE" if active is not None else current_values[3]
-        new_pending = str(pending) if pending is not None else str(to_float(current_values[4]))
-        w.update(f"A{row_idx}:E{row_idx}", [[str(chat_id), new_name, new_deposit, new_active, new_pending]])
+        current = w.row_values(row_idx)
+        while len(current) < 5:
+            current.append("")
+        new_name    = v(name, current[1])
+        new_deposit = str(v(deposit, to_float(current[2])))
+        new_active  = "TRUE" if active else "FALSE" if active is not None else current[3]
+        new_pending = str(pending) if pending is not None else str(to_float(current[4]))
+
+        row = [str(chat_id), new_name, new_deposit, new_active, new_pending]
+        w.update(f"A{row_idx}:E{row_idx}", [row])
     else:
-        w.append_row([str(chat_id), name or "", str(deposit or 0), "TRUE" if (active is None or active) else "FALSE", str(pending or 0)])
+        w.append_row(
+            [str(chat_id), name or "", str(deposit or 0),
+             "TRUE" if (active is None or active) else "FALSE", str(pending or 0)],
+            value_input_option="RAW"
+        )
 
 # ------------------- Helpers -------------------
 def fmt_usd(x): return f"{x:,.2f}".replace(",", " ")
