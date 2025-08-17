@@ -56,7 +56,6 @@ CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 if not CREDS_JSON:
     raise RuntimeError("GOOGLE_CREDENTIALS env var not set")
 
-# ИСПРАВЛЕНО: безопасное использование json.loads вместо eval
 gc = gspread.service_account_from_dict(json.loads(CREDS_JSON))
 sh = gc.open_by_key(SHEET_ID)
 
@@ -210,14 +209,16 @@ async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return await update.message.reply_text("Команды управления доступны только админу.")
-    await update.message.reply_text(
-        "/adduser <chat_id> <Имя> <депозит>\n"
-        "/setdep <chat_id> <депозит>  (вступит в силу со следующей сделкой)\n"
-        "/setname <chat_id> <Имя>\n"
-        "/remove <chat_id>\n"
-        "/list",
-        parse_mode=constants.ParseMode.HTML
+    # ИСПРАВЛЕНО: Экранирование < > для parse_mode=HTML
+    text = (
+        "<b>Админ-команды:</b>\n"
+        "/adduser &lt;chat_id&gt; &lt;Имя&gt; &lt;депозит&gt;\n"
+        "/setdep &lt;chat_id&gt; &lt;депозит&gt; (вступит в силу со следующей сделкой)\n"
+        "/setname &lt;chat_id&gt; &lt;Имя&gt;\n"
+        "/remove &lt;chat_id&gt;\n"
+        "/list"
     )
+    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
 
 async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
@@ -290,7 +291,6 @@ async def poll_and_broadcast(app: Application):
         records = sheet_dicts(ws(LOG_SHEET))
         total_rows_in_sheet = len(records) + 1
         
-        # ИСПРАВЛЕНО: защита от "заливки" истории при первом запуске
         if last_row == 0:
             log.info(f"First run detected. Skipping {total_rows_in_sheet} historical records.")
             set_state(last_row=total_rows_in_sheet, profit_total=0.0)
@@ -379,7 +379,6 @@ async def poll_and_broadcast(app: Application):
     except Exception as e:
         log.exception("poll_and_broadcast error")
 
-# ИСПРАВЛЕНО: async-колбэк для JobQueue
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     await poll_and_broadcast(context.application)
 
@@ -404,7 +403,6 @@ def main():
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("list", list_users))
 
-    # ИСПРАВЛЕНО: передача async-колбэка в run_repeating
     app.job_queue.run_repeating(poll_job, interval=10, first=5)
 
     log.info(f"{BOT_NAME} starting…")
