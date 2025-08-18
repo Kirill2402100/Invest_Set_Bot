@@ -326,6 +326,7 @@ async def poll_and_broadcast(app: Application):
         for rec in new_records:
             ev, sid = rec.get("Event") or "", rec.get("Signal_ID") or ""
             cum_margin, pnl_usd = to_float(rec.get("Cum_Margin_USDT")), to_float(rec.get("PNL_Realized_USDT"))
+            
             if ev in ("OPEN", "ADD", "RETEST_ADD"):
                 if ev == "OPEN":
                     for u in users:
@@ -335,7 +336,9 @@ async def poll_and_broadcast(app: Application):
                     recipients = [u["chat_id"] for u in users]
                     open_positions[sid] = {"cum_margin": cum_margin, "users": recipients}
                 else:
-                    recipients = open_positions.get(sid, {}).get("users", [])
+                    snap = open_positions.setdefault(sid, {"cum_margin": 0.0, "users": []})
+                    snap["cum_margin"] = cum_margin
+                    recipients = snap["users"]
                 if not recipients: continue
                 used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
                 if ev == "OPEN":
@@ -343,6 +346,7 @@ async def poll_and_broadcast(app: Application):
                 else:
                     msg = f"🪙💵 Докупили {base_from_pair(rec.get('Pair', ''))}. Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
                 for uid in recipients: push(uid, msg)
+            
             if ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
                 snapshot = open_positions.get(sid, {})
                 recipients, cm = snapshot.get("users", []), snapshot.get("cum_margin", cum_margin)
@@ -356,13 +360,18 @@ async def poll_and_broadcast(app: Application):
                     except Exception as e:
                         log.warning(f"fallback recipients failed for {sid}: {e}")
                 if not recipients: continue
+                
+                profit_total += pnl_usd
+                total_dep = sum(x["deposit"] for x in users if x["active"]) or 1.0
+                
                 used_pct = 100.0 * (cm / max(SYSTEM_BANK_USDT, 1e-9))
                 profit_pct = (pnl_usd / max(cm, 1e-9)) * 100.0 if cm > 0 else 0.0
                 icon = tier_emoji(profit_pct) if pnl_usd >= 0 else "🛑"
-                profit_total += pnl_usd
+
                 for u in users:
                     if u["chat_id"] not in recipients: continue
-                    ann_pct, ann_usd = annual_forecast(profit_total, start_utc, u["deposit"])
+                    my_profit_total = profit_total * (u["deposit"] / total_dep)
+                    ann_pct, ann_usd = annual_forecast(my_profit_total, start_utc, u["deposit"])
                     txt = (f"{icon} Сделка закрыта. Использовалось {used_pct:.1f}% банка ({fmt_usd(cm)}). "
                            f"P&L: {fmt_usd(pnl_usd)} ({profit_pct:+.2f}%).\n"
                            f"Оценка годовых по депозиту {fmt_usd(u['deposit'])}: ~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год).")
@@ -374,6 +383,7 @@ async def poll_and_broadcast(app: Application):
             await send_all(app, final_messages)
         set_state(last_row=total_rows_in_sheet, profit_total=profit_total)
     except Exception as e: log.exception("poll_and_broadcast error")
+
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     await poll_and_broadcast(context.application)
 
