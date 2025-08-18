@@ -4,7 +4,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
 import gspread
-from google.oauth2.service_account import Credentials
 from telegram import (
     Update, constants, BotCommand,
     BotCommandScopeChat, BotCommandScopeAllPrivateChats
@@ -20,21 +19,16 @@ BOT_TOKEN = os.getenv("MARKETING_BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 
 def parse_admin_ids(raw: str) -> set[int]:
-    if not raw:
-        return set()
+    if not raw: return set()
     try:
         maybe = json.loads(raw)
-        if isinstance(maybe, (list, tuple, set)):
-            return {int(x) for x in maybe}
-        if isinstance(maybe, (int, str)) and str(maybe).lstrip("-").isdigit():
-            return {int(maybe)}
-    except Exception:
-        pass
+        if isinstance(maybe, (list, tuple, set)): return {int(x) for x in maybe}
+        if isinstance(maybe, (int, str)) and str(maybe).lstrip("-").isdigit(): return {int(maybe)}
+    except Exception: pass
     out = set()
     for t in re.split(r'[\s,;]+', raw.strip()):
         t = t.strip().strip('[](){}"\'')
-        if t and (t.lstrip("-").isdigit()):
-            out.add(int(t))
+        if t and (t.lstrip("-").isdigit()): out.add(int(t))
     return out
 
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
@@ -42,6 +36,9 @@ SYSTEM_BANK_USDT = float(os.getenv("SYSTEM_BANK_USDT", "1000"))
 
 if not BOT_TOKEN or not SHEET_ID or not ADMIN_IDS:
     raise RuntimeError("MARKETING_BOT_TOKEN / SHEET_ID / ADMIN_IDS обязательны")
+
+def now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ------------------- LOG -------------------
 log = logging.getLogger("marketing")
@@ -52,42 +49,28 @@ log.info(f"ADMIN_IDS raw={os.getenv('ADMIN_IDS')}")
 log.info(f"ADMIN_IDS parsed={sorted(ADMIN_IDS)}")
 
 # --- Меню команд ---
-USER_COMMANDS = [
-    BotCommand("start", "Как подключиться"),
-    BotCommand("balance", "Показать баланс"),
-]
-
+USER_COMMANDS = [BotCommand("start", "Как подключиться"), BotCommand("balance", "Показать баланс")]
 ADMIN_COMMANDS = [
-    BotCommand("start", "Показать chat_id"),
-    BotCommand("help", "Команды админа"),
-    BotCommand("list", "Список пользователей"),
-    BotCommand("adduser", "Добавить пользователя"),
+    BotCommand("start", "Показать chat_id"), BotCommand("help", "Команды админа"),
+    BotCommand("list", "Список пользователей"), BotCommand("adduser", "Добавить пользователя"),
     BotCommand("setdep", "Изменить депозит (со след. сделки)"),
-    BotCommand("setname", "Переименовать пользователя"),
-    BotCommand("remove", "Отключить пользователя"),
+    BotCommand("setname", "Переименовать пользователя"), BotCommand("remove", "Отключить пользователя"),
 ]
 
 async def set_menu_default(app: Application):
-    await app.bot.set_my_commands(
-        [BotCommand("start", "Как подключиться")],
-        scope=BotCommandScopeAllPrivateChats()
-    )
+    await app.bot.set_my_commands([BotCommand("start", "Как подключиться")], scope=BotCommandScopeAllPrivateChats())
 
 async def set_menu_user(app: Application, chat_id: int):
     await app.bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeChat(chat_id))
 
 async def set_menu_admins(app: Application):
     for aid in ADMIN_IDS:
-        try:
-            await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(aid))
-        except Exception as e:
-            log.error(f"Failed to set menu for admin {aid}: {e}")
+        try: await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(aid))
+        except Exception as e: log.error(f"Failed to set menu for admin {aid}: {e}")
 
 # ------------------- Sheets -------------------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-if not CREDS_JSON:
-    raise RuntimeError("GOOGLE_CREDENTIALS env var not set")
+if not CREDS_JSON: raise RuntimeError("GOOGLE_CREDENTIALS env var not set")
 
 gc = gspread.service_account_from_dict(json.loads(CREDS_JSON))
 sh = gc.open_by_key(SHEET_ID)
@@ -106,7 +89,16 @@ def ensure_sheets():
     if STATE_SHEET not in names:
         ws = sh.add_worksheet(STATE_SHEET, rows=10, cols=3)
         ws.update("A1:C1", [["Last_Row", "Start_UTC", "Profit_Total_USDT"]])
-        ws.update("A2:C2", [["0", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "0"]])
+        ws.update("A2:C2", [["0", now_utc_str(), "0"]])
+    else:
+        ws = sh.worksheet(STATE_SHEET)
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            ws.update("A2:C2", [["0", now_utc_str(), "0"]])
+        else:
+            cur = (ws.acell("B2").value or "").strip()
+            if not cur:
+                ws.update_acell("B2", now_utc_str())
     if LOG_SHEET not in names:
         raise RuntimeError(f"Не найден лист {LOG_SHEET} (его пишет основной бот)")
 
@@ -118,13 +110,14 @@ def get_state():
     w = ws(STATE_SHEET)
     val_last_row, val_start_utc, val_profit_total = w.acell("A2").value, w.acell("B2").value, w.acell("C2").value
     last_row = int(val_last_row) if (val_last_row or "").strip().isdigit() else 0
-    start_utc = val_start_utc or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    start_utc = val_start_utc or ""
     profit_total = to_float(val_profit_total)
     return last_row, start_utc, profit_total
 
-def set_state(last_row: Optional[int] = None, profit_total: Optional[float] = None):
+def set_state(last_row: Optional[int] = None, profit_total: Optional[float] = None, start_utc: Optional[str] = None):
     w = ws(STATE_SHEET)
     if last_row is not None: w.update_acell("A2", str(last_row))
+    if start_utc is not None: w.update_acell("B2", start_utc)
     if profit_total is not None: w.update_acell("C2", str(profit_total))
 
 def get_users() -> List[Dict[str, Any]]:
@@ -140,10 +133,10 @@ def get_users() -> List[Dict[str, Any]]:
             })
         except (ValueError, TypeError):
             log.warning(f"Skipping invalid user row: {r}")
+            continue
     return res
 
-def upsert_user_row(chat_id: int, name: str = None, deposit: float = None,
-                    active: bool = None, pending: float = None):
+def upsert_user_row(chat_id: int, name: str = None, deposit: float = None, active: bool = None, pending: float = None):
     w = ws(USERS_SHEET)
     row_idx = None
     try:
@@ -172,44 +165,38 @@ def upsert_user_row(chat_id: int, name: str = None, deposit: float = None,
     else:
         w.append_row([str(chat_id), name or "", str(deposit or 0), "TRUE" if (active is None or active) else "FALSE", str(pending or 0)], value_input_option="RAW")
 
-# ------------------- Helpers -------------------
+# ------------------- Helpers & Parsers -------------------
 def fmt_usd(x): return f"{x:,.2f}".replace(",", " ")
-def fmt_pct(x): return f"{x:.2f}%"
-def tier_emoji(profit_pct_of_margin: float) -> str:
-    if profit_pct_of_margin >= 90: return "🚀"
-    if profit_pct_of_margin >= 80: return "🛩️"
-    if profit_pct_of_margin >= 70: return "🏎️"
-    if profit_pct_of_margin >= 50: return "🏍️"
+def tier_emoji(profit_pct: float) -> str:
+    if profit_pct >= 90: return "🚀"
+    if profit_pct >= 80: return "🛩️"
+    if profit_pct >= 70: return "🏎️"
+    if profit_pct >= 50: return "🏍️"
     return "✅"
 def base_from_pair(pair: str) -> str:
     base = (pair or "").split("/")[0].split(":")[0].upper()
     return base[:-1] if base.endswith("C") and len(base) > 3 else base
-
 def parse_money(s: str) -> float:
     return float(re.sub(r"[^\d.,\-]", "", s).replace(",", "."))
-
 def parse_setdep_text(text: str):
     m = re.match(r"^/setdep\s+(-?\d+)\s+([0-9][\d\s.,]*)\s*$", text.strip(), re.I)
     if not m: return None
     return int(m.group(1)), parse_money(m.group(2))
-
 open_positions: Dict[str, Dict[str, Any]] = {}
-
-def annual_forecast(profit_total_usdt: float, start_utc: str, deposit: float) -> (float, float):
+def annual_forecast(profit_total: float, start_utc: str, deposit: float) -> (float, float):
     try: start_dt = datetime.strptime(start_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError): start_dt = datetime.now(timezone.utc) - timedelta(days=1)
+    except (ValueError, TypeError): return 0.0, 0.0
     days_passed = (datetime.now(timezone.utc) - start_dt).total_seconds() / (24 * 3600)
     days = max(days_passed, 1)
     if deposit <= 0: return 0.0, 0.0
-    annual_pct = (profit_total_usdt / deposit) * (365.0 / days) * 100.0
+    annual_pct = (profit_total / deposit) * (365.0 / days) * 100.0
     return annual_pct, deposit * annual_pct / 100.0
 
-# ------------------- Telegram -------------------
+# ------------------- Telegram Handlers -------------------
 def is_admin(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
     cid = update.effective_chat.id if update.effective_chat else None
     return (uid in ADMIN_IDS) or (cid in ADMIN_IDS)
-
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid, cid = update.effective_user.id, update.effective_chat.id
     txt = (f"Привет! Я <b>{BOT_NAME}</b>.\n"
@@ -217,14 +204,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
            f"Твой <b>chat_id</b>: <code>{cid}</code>\n"
            f"Чтобы подключиться, передай этот chat_id админу.")
     await update.message.reply_text(txt, parse_mode=constants.ParseMode.HTML)
-
 async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid, cid = update.effective_user.id, update.effective_chat.id
     await update.message.reply_text(f"user_id={uid}\nchat_id={cid}\nadmin={is_admin(update)}")
-
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await update.message.reply_text("Команды управления доступны только админу.")
+    if not is_admin(update): return
     text = (
         "Админ-команды:\n"
         "/adduser <chat_id> <Имя (можно с пробелами)> <депозит>\n"
@@ -234,13 +218,12 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/list"
     )
     await update.message.reply_text(text)
-
 async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     try:
         args = ctx.args
         if len(args) < 3: raise ValueError
-        chat_id, dep = int(args[0]), float(args[-1])
+        chat_id, dep = int(args[0]), parse_money(args[-1])
         name = " ".join(args[1:-1]).strip() or str(chat_id)
     except (ValueError, IndexError):
         return await update.message.reply_text("Использование: /adduser <chat_id> <Имя (можно с пробелами)> <депозит>")
@@ -255,7 +238,6 @@ async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить приветствие {chat_id}: {e}")
-
 async def setdep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     parsed = parse_setdep_text(update.message.text or "")
@@ -264,34 +246,36 @@ async def setdep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id, dep = parsed
     upsert_user_row(chat_id, pending=dep)
     await update.message.reply_text(f"OK. Pending-депозит {fmt_usd(dep)} USDT применится со следующей сделкой.")
-
 async def setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    try: chat_id = int(ctx.args[0]); name = " ".join(ctx.args[1:])
-    except (IndexError, ValueError): return await update.message.reply_text("Использование: /setname <chat_id> <Имя>")
+    try:
+        chat_id = int(ctx.args[0]); name = " ".join(ctx.args[1:])
+        if not name: raise ValueError
+    except (IndexError, ValueError): return await update.message.reply_text("Использование: /setname <chat_id> <Новое Имя>")
     upsert_user_row(chat_id, name=name)
     await update.message.reply_text("OK. Имя обновлено.")
-
 async def remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     try: chat_id = int(ctx.args[0])
     except (IndexError, ValueError): return await update.message.reply_text("Использование: /remove <chat_id>")
     upsert_user_row(chat_id, active=False)
     await update.message.reply_text("OK. Пользователь деактивирован.")
-
+    try:
+        await ctx.application.bot.set_my_commands([BotCommand("start", "Как подключиться")], scope=BotCommandScopeChat(chat_id))
+    except Exception as e:
+        log.warning(f"set default menu for {chat_id} failed: {e}")
 async def list_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     users = get_users()
     if not users: return await update.message.reply_text("Список пуст.")
     lines = [f"{'✅' if u['active'] else '⛔️'} {u['name'] or u['chat_id']} | dep={fmt_usd(u['deposit'])} | pending={fmt_usd(u['pending'])} | id={u['chat_id']}" for u in users]
     await update.message.reply_text("\n".join(lines))
-
 async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     u = next((x for x in get_users() if x["chat_id"] == cid and x["active"]), None)
     if not u:
         return await update.message.reply_text("Вы ещё не подключены. Отправьте /start и передайте ваш chat_id админу.")
-    _, _start_utc, profit_total = get_state()
+    _, start_utc, profit_total = get_state()
     total_dep = sum(x["deposit"] for x in get_users() if x["active"]) or 1.0
     my_profit = profit_total * (u["deposit"] / total_dep)
     await update.message.reply_text(
@@ -302,13 +286,12 @@ async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=constants.ParseMode.HTML
     )
 
-# ------------------- Messaging & Poller -------------------
+# ------------------- Poller & Main Logic -------------------
 async def send_all(app: Application, text_by_user: Dict[int, str]):
     for chat_id, text in text_by_user.items():
         if text.strip():
             try: await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
             except Exception as e: log.warning(f"send to {chat_id} failed: {e}")
-
 def sheet_dicts(worksheet) -> List[Dict[str, Any]]:
     vals = worksheet.get_all_values()
     if not vals or len(vals) < 2: return []
@@ -316,14 +299,16 @@ def sheet_dicts(worksheet) -> List[Dict[str, Any]]:
     for row in vals[1:]:
         out.append({headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))})
     return out
-
 async def poll_and_broadcast(app: Application):
     try:
         last_row, start_utc, profit_total = get_state()
+        if not (start_utc or "").strip():
+            start_utc = now_utc_str()
+            set_state(start_utc=start_utc)
         records = sheet_dicts(ws(LOG_SHEET))
         total_rows_in_sheet = len(records) + 1
         if last_row == 0:
-            log.info(f"First run. Skipping {total_rows_in_sheet} records.")
+            log.info(f"First run detected. Skipping {total_rows_in_sheet} historical records.")
             set_state(last_row=total_rows_in_sheet, profit_total=0.0)
             return
         if total_rows_in_sheet <= last_row: return
@@ -332,58 +317,63 @@ async def poll_and_broadcast(app: Application):
         if not users:
             set_state(last_row=total_rows_in_sheet)
             return
-        broadcast_general, personal_texts = [], {u["chat_id"]: "" for u in users}
+        
+        per_user_msgs: Dict[int, List[str]] = {}
+        def push(uid: int, text: str):
+            if not text: return
+            per_user_msgs.setdefault(uid, []).append(text)
+        
         for rec in new_records:
             ev, sid = rec.get("Event") or "", rec.get("Signal_ID") or ""
             cum_margin, pnl_usd = to_float(rec.get("Cum_Margin_USDT")), to_float(rec.get("PNL_Realized_USDT"))
-            
-            if ev == "OPEN":
-                for u in users:
-                    if u["pending"] > 0:
-                        upsert_user_row(u["chat_id"], deposit=u["pending"], pending=0)
-                        u["deposit"], u["pending"] = u["pending"], 0
-                aud = {u["chat_id"] for u in users}
-                open_positions[sid] = {"cum_margin": cum_margin, "aud": aud}
+            if ev in ("OPEN", "ADD", "RETEST_ADD"):
+                if ev == "OPEN":
+                    for u in users:
+                        if u["pending"] > 0:
+                            upsert_user_row(u["chat_id"], deposit=u["pending"], pending=0)
+                            u["deposit"], u["pending"] = u["pending"], 0
+                    recipients = [u["chat_id"] for u in users]
+                    open_positions[sid] = {"cum_margin": cum_margin, "users": recipients}
+                else:
+                    recipients = open_positions.get(sid, {}).get("users", [])
+                if not recipients: continue
                 used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
-                broadcast_general.append(f"📊 Сделка открыта. Задействовано {used_pct:.1f}% банка ({fmt_usd(cum_margin)}).")
-            
-            elif ev in ("ADD", "RETEST_ADD"):
-                base, aud = base_from_pair(rec.get("Pair", "")), open_positions.get(sid, {}).get("aud", set())
-                used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
-                msg = f"🪙💵 Докупили {base}. Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
-                for chat_id in aud:
-                    chunk = personal_texts.get(chat_id, "")
-                    personal_texts[chat_id] = (chunk + ("\n\n" if chunk else "") + msg)
-
-            elif ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
-                cm, aud = open_positions.get(sid, {}).get("cum_margin", cum_margin), open_positions.get(sid, {}).get("aud", set())
+                if ev == "OPEN":
+                    msg = f"📊 Сделка открыта. Задействовано {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
+                else:
+                    msg = f"🪙💵 Докупили {base_from_pair(rec.get('Pair', ''))}. Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
+                for uid in recipients: push(uid, msg)
+            if ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
+                snapshot = open_positions.get(sid, {})
+                recipients, cm = snapshot.get("users", []), snapshot.get("cum_margin", cum_margin)
+                if not recipients:
+                    try:
+                        for r in reversed(records[-300:]):
+                            if r.get("Signal_ID") == sid and r.get("Event") == "OPEN":
+                                recipients = [u["chat_id"] for u in users]
+                                cm = to_float(r.get("Cum_Margin_USDT")) or cm
+                                break
+                    except Exception as e:
+                        log.warning(f"fallback recipients failed for {sid}: {e}")
+                if not recipients: continue
+                used_pct = 100.0 * (cm / max(SYSTEM_BANK_USDT, 1e-9))
                 profit_pct = (pnl_usd / max(cm, 1e-9)) * 100.0 if cm > 0 else 0.0
+                icon = tier_emoji(profit_pct) if pnl_usd >= 0 else "🛑"
                 profit_total += pnl_usd
                 for u in users:
-                    if u["chat_id"] not in aud: continue
+                    if u["chat_id"] not in recipients: continue
                     ann_pct, ann_usd = annual_forecast(profit_total, start_utc, u["deposit"])
-                    personal_texts[u['chat_id']] = (f"{tier_emoji(profit_pct) if pnl_usd >= 0 else '🛑'} Сделка закрыта. Использовалось {100. * cm / max(SYSTEM_BANK_USDT, 1e-9):.1f}% банка ({fmt_usd(cm)}). "
-                                                    f"P&L: {fmt_usd(pnl_usd)} ({profit_pct:+.2f}%).\n"
-                                                    f"Оценка годовых по депозиту {fmt_usd(u['deposit'])}: ~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год).")
+                    txt = (f"{icon} Сделка закрыта. Использовалось {used_pct:.1f}% банка ({fmt_usd(cm)}). "
+                           f"P&L: {fmt_usd(pnl_usd)} ({profit_pct:+.2f}%).\n"
+                           f"Оценка годовых по депозиту {fmt_usd(u['deposit'])}: ~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год).")
+                    push(u["chat_id"], txt)
                 if sid in open_positions: del open_positions[sid]
         
-        # Сборка и отправка сообщений
-        final_messages = {}
-        # Сначала общие сообщения для аудитории OPEN
-        general_text = "\n\n".join(broadcast_general)
-        open_aud = {cid for pos in open_positions.values() for cid in pos.get("aud", set()) if broadcast_general}
-        for chat_id in open_aud:
-            final_messages[chat_id] = general_text
-        # Затем добавляем персональные (ADD/CLOSE)
-        for chat_id, personal_msg in personal_texts.items():
-            if not personal_msg: continue
-            existing = final_messages.get(chat_id, "")
-            final_messages[chat_id] = (existing + ("\n\n" if existing else "") + personal_msg)
-
-        if final_messages: await send_all(app, final_messages)
+        final_messages = {uid: "\n\n".join(msgs) for uid, msgs in per_user_msgs.items() if msgs}
+        if final_messages:
+            await send_all(app, final_messages)
         set_state(last_row=total_rows_in_sheet, profit_total=profit_total)
     except Exception as e: log.exception("poll_and_broadcast error")
-
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     await poll_and_broadcast(context.application)
 
@@ -391,21 +381,27 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await set_menu_default(app)
     await set_menu_admins(app)
-
+    try:
+        users = [u for u in get_users() if u.get("active")]
+        for u in users:
+            try:
+                await set_menu_user(app, int(u["chat_id"]))
+            except Exception as e:
+                log.warning(f"set_menu_user failed for {u}: {e}")
+    except Exception as e:
+        log.warning(f"post_init: could not restore user menus: {e}")
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("whoami", whoami))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("adduser", adduser))
-    app.add_handler(CommandHandler("setdep", setdep))
-    app.add_handler(CommandHandler("setname", setname))
-    app.add_handler(CommandHandler("remove", remove))
-    app.add_handler(CommandHandler("list", list_users))
+    handlers = [
+        CommandHandler("start", start), CommandHandler("help", help_cmd),
+        CommandHandler("whoami", whoami), CommandHandler("balance", balance),
+        CommandHandler("adduser", adduser), CommandHandler("setdep", setdep),
+        CommandHandler("setname", setname), CommandHandler("remove", remove),
+        CommandHandler("list", list_users)
+    ]
+    for handler in handlers: app.add_handler(handler)
     app.job_queue.run_repeating(poll_job, interval=10, first=5)
     log.info(f"{BOT_NAME} starting…")
     app.run_polling()
-
 if __name__ == "__main__":
     main()
