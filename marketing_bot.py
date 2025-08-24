@@ -1,7 +1,8 @@
-# marketing_bot.py — STRIGI_KAPUSTU_BOT (обновлено)
-import os, time, logging, math, re, json
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+# marketing_bot.py — STRIGI_KAPUSTU_BOT (полная версия)
+
+import os, logging, re, json
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 import gspread
 from telegram import (
@@ -24,11 +25,13 @@ def parse_admin_ids(raw: str) -> set[int]:
         maybe = json.loads(raw)
         if isinstance(maybe, (list, tuple, set)): return {int(x) for x in maybe}
         if isinstance(maybe, (int, str)) and str(maybe).lstrip("-").isdigit(): return {int(maybe)}
-    except Exception: pass
+    except Exception:
+        pass
     out = set()
     for t in re.split(r'[\s,;]+', raw.strip()):
         t = t.strip().strip('[](){}"\'')
-        if t and (t.lstrip("-").isdigit()): out.add(int(t))
+        if t and (t.lstrip("-").isdigit()):
+            out.add(int(t))
     return out
 
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
@@ -43,23 +46,33 @@ def now_utc_str() -> str:
 # ------------------- LOG -------------------
 log = logging.getLogger("marketing")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log.info(f"ADMIN_IDS parsed={sorted(ADMIN_IDS)}")
 
-# --- Меню команд ---
+# ------------------- Меню команд -------------------
 USER_COMMANDS = [
     BotCommand("start", "Как подключиться"),
     BotCommand("about", "О боте"),
     BotCommand("myname", "Указать имя"),
+    BotCommand("balance", "Баланс"),
     BotCommand("add_deposit", "Добавить депозит"),
     BotCommand("add_from_bonus", "Пополнить из премии"),
     BotCommand("withdraw_bonus", "Вывести премию"),
     BotCommand("withdraw_all", "Вывести весь депозит"),
-    BotCommand("balance", "Показать баланс")
+    BotCommand("mywallet", "Мой кошелёк"),
+    BotCommand("setwallet", "Задать кошелёк"),
 ]
 ADMIN_COMMANDS = [
-    BotCommand("start", "Показать chat_id"), BotCommand("help", "Команды админа"),
-    BotCommand("list", "Список пользователей"), BotCommand("adduser", "Добавить пользователя"),
+    BotCommand("help", "Команды админа"),
+    BotCommand("list", "Список пользователей"),
+    BotCommand("adduser", "Добавить пользователя"),
     BotCommand("setdep", "Изменить депозит (со след. сделки)"),
-    BotCommand("setname", "Переименовать пользователя"), BotCommand("remove", "Отключить пользователя"),
+    BotCommand("setname", "Переименовать пользователя"),
+    BotCommand("remove", "Отключить пользователя"),
+    BotCommand("approve_wallet", "Подтвердить кошелёк"),
+    BotCommand("reject_wallet", "Отклонить кошелёк"),
+    BotCommand("apply_from_bonus", "В депозит из премии"),
+    BotCommand("pay_bonus", "Выплатить премию"),
+    BotCommand("pay_all", "Вывести всё и отключить"),
 ]
 
 async def set_menu_default(app: Application):
@@ -73,12 +86,15 @@ async def set_menu_user(app: Application, chat_id: int):
 
 async def set_menu_admins(app: Application):
     for aid in ADMIN_IDS:
-        try: await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(aid))
-        except Exception as e: log.error(f"Failed to set menu for admin {aid}: {e}")
+        try:
+            await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(aid))
+        except Exception as e:
+            log.error(f"Failed to set menu for admin {aid}: {e}")
 
 # ------------------- Sheets -------------------
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-if not CREDS_JSON: raise RuntimeError("GOOGLE_CREDENTIALS env var not set")
+if not CREDS_JSON:
+    raise RuntimeError("GOOGLE_CREDENTIALS env var not set")
 
 gc = gspread.service_account_from_dict(json.loads(CREDS_JSON))
 sh = gc.open_by_key(SHEET_ID)
@@ -88,94 +104,150 @@ USERS_SHEET = "Marketing_Users"
 STATE_SHEET = "Marketing_State"
 LEDGER_SHEET= "Marketing_Ledger"
 
-USERS_COLS = [
+# Требуемые хедеры таблиц
+USERS_HEADERS = [
     "Chat_ID","Name","Deposit_USDT","Active","Pending_Deposit",
-    "Bonus_Accrued","Bonus_Paid","Bonus_To_Deposit","Last_Update"
+    "Bonus_Accrued","Bonus_Paid","Bonus_To_Deposit",
+    "Wallet_Address","Wallet_Network",
+    "Wallet_Pending_Address","Wallet_Pending_Network",
+    "Wallet_Updated_UTC","Last_Update"
+]
+STATE_HEADERS = ["Last_Row","Start_UTC","Profit30_Total_USDT"]
+LEDGER_HEADERS = [
+    "Timestamp_UTC","Type","Chat_ID","Name","Amount_USDT","Note","Admin",
+    "Signal_ID","Tx_Direction","Old_Address","Old_Network","New_Address","New_Network","Status"
 ]
 
+# ------------- helpers -------------
 def to_float(x) -> float:
-    try: return float(str(x).replace(",", "."))
-    except (ValueError, TypeError): return 0.0
+    try:
+        return float(str(x).replace(",", ".").strip())
+    except (ValueError, TypeError):
+        return 0.0
 
-def ws(title): return sh.worksheet(title)
+def parse_money(s: str) -> float:
+    s = (s or "").strip()
+    if s.lower() == "all":
+        return float("nan")  # спец-значение: "all"
+    return float(re.sub(r"[^\d.,\-]", "", s).replace(",", "."))
 
-def ensure_header(worksheet, required_cols: List[str]):
-    vals = worksheet.get_all_values()
-    current = vals[0] if vals else []
-    if current == required_cols:
-        return
-    # обновляем хедер (остальные строки остаются)
-    end_col = chr(ord('A') + len(required_cols) - 1)
-    worksheet.update(f"A1:{end_col}1", [required_cols])
+def fmt_usd(x) -> str:
+    try:
+        v = float(x)
+    except:
+        v = 0.0
+    return f"{v:,.2f}".replace(",", " ")
 
-def ensure_sheets():
-    names = {ws.title for ws in sh.worksheets()}
-    if USERS_SHEET not in names:
-        ws_u = sh.add_worksheet(USERS_SHEET, rows=2000, cols=len(USERS_COLS))
-        ensure_header(ws_u, USERS_COLS)
-    else:
-        ws_u = sh.worksheet(USERS_SHEET)
-        ensure_header(ws_u, USERS_COLS)
+def is_admin(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    cid = update.effective_chat.id if update.effective_chat else None
+    return (uid in ADMIN_IDS) or (cid in ADMIN_IDS)
 
-    if STATE_SHEET not in names:
-        ws_s = sh.add_worksheet(STATE_SHEET, rows=10, cols=3)
-        ws_s.update("A1:C1", [["Last_Row", "Start_UTC", "Profit_Total_USDT"]])
-        ws_s.update("A2:C2", [["0", now_utc_str(), "0"]])
-    else:
-        ws_s = sh.worksheet(STATE_SHEET)
-        vals = ws_s.get_all_values()
-        if len(vals) < 2:
-            ws_s.update("A2:C2", [["0", now_utc_str(), "0"]])
-        if not (ws_s.acell("B2").value or "").strip():
-            ws_s.update_acell("B2", now_utc_str())
+def base_from_pair(pair: str) -> str:
+    base = (pair or "").split("/")[0].split(":")[0].upper()
+    return base[:-1] if base.endswith("C") and len(base) > 3 else base
 
-    if LEDGER_SHEET not in names:
-        ws_l = sh.add_worksheet(LEDGER_SHEET, rows=2000, cols=8)
-        ws_l.update("A1:H1", [[
-            "Timestamp_UTC","Type","Chat_ID","Name","Amount_USDT","Note","Admin","Status"
-        ]])
-
-    if LOG_SHEET not in names:
-        raise RuntimeError(f"Не найден лист {LOG_SHEET} (его пишет основной бот)")
-ensure_sheets()
-
-# --------- Helpers for Users sheet ----------
 def sheet_dicts(worksheet) -> List[Dict[str, Any]]:
     vals = worksheet.get_all_values()
-    if not vals or len(vals) < 2: return []
+    if not vals or len(vals) < 2:
+        return []
     headers, out = vals[0], []
     for row in vals[1:]:
         out.append({headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))})
     return out
 
+def ws(title): return sh.worksheet(title)
+
+def ensure_headers(ws_title: str, required: List[str]):
+    names = {w.title for w in sh.worksheets()}
+    if ws_title not in names:
+        ws_new = sh.add_worksheet(ws_title, rows=200, cols=max(10, len(required)))
+        ws_new.update(f"A1:{chr(64+len(required))}1", [required])
+        return
+    w = ws(ws_title)
+    vals = w.get_all_values()
+    existing = vals[0] if vals else []
+    missing = [h for h in required if h not in existing]
+    if not existing:
+        w.update(f"A1:{chr(64+len(required))}1", [required])
+        return
+    if missing:
+        # добавим недостающие столбцы в конец
+        new_headers = existing + missing
+        w.resize(rows=max(len(vals), 2), cols=len(new_headers))
+        w.update(f"A1:{chr(64+len(new_headers))}1", [new_headers])
+        # добьём пустые значения по новым колонкам
+        if len(vals) > 1:
+            blanks = [[""] * len(missing) for _ in range(len(vals)-1)]
+            w.update(f"{chr(64+len(existing)+1)}2:{chr(64+len(new_headers))}{len(vals)}", blanks)
+
+def ensure_sheets():
+    ensure_headers(USERS_SHEET, USERS_HEADERS)
+    ensure_headers(STATE_SHEET, STATE_HEADERS)
+    ensure_headers(LEDGER_SHEET, LEDGER_HEADERS)
+    names = {w.title for w in sh.worksheets()}
+    if LOG_SHEET not in names:
+        raise RuntimeError(f"Не найден лист {LOG_SHEET} (его пишет основной бот)")
+    # init state defaults
+    wst = ws(STATE_SHEET)
+    vals = wst.get_all_values()
+    if len(vals) < 2:
+        wst.update("A2:C2", [["0", now_utc_str(), "0"]])
+    else:
+        if not (wst.acell("B2").value or "").strip():
+            wst.update_acell("B2", now_utc_str())
+        if not (wst.acell("C2").value or "").strip():
+            wst.update_acell("C2", "0")
+
+ensure_sheets()
+
+# ------------ CRUD users/state/ledger ------------
+def get_state() -> Tuple[int, str, float]:
+    w = ws(STATE_SHEET)
+    a, b, c = w.acell("A2").value, w.acell("B2").value, w.acell("C2").value
+    last_row = int(a) if (a or "").strip().isdigit() else 0
+    start_utc = b or now_utc_str()
+    profit30_total = to_float(c)
+    return last_row, start_utc, profit30_total
+
+def set_state(last_row: Optional[int] = None, profit30_total: Optional[float] = None, start_utc: Optional[str] = None):
+    w = ws(STATE_SHEET)
+    if last_row is not None: w.update_acell("A2", str(last_row))
+    if start_utc is not None: w.update_acell("B2", start_utc)
+    if profit30_total is not None: w.update_acell("C2", str(profit30_total))
+
 def get_users() -> List[Dict[str, Any]]:
-    vals = sheet_dicts(ws(USERS_SHEET))
+    vals = ws(USERS_SHEET).get_all_records()
     res = []
     for r in vals:
         try:
             res.append({
                 "chat_id": int(r.get("Chat_ID")),
-                "name": (r.get("Name") or "").strip(),
+                "name": r.get("Name") or "",
                 "deposit": to_float(r.get("Deposit_USDT")),
                 "active": str(r.get("Active", "TRUE")).strip().upper() not in ("FALSE", "0", ""),
                 "pending": to_float(r.get("Pending_Deposit")),
                 "bonus_acc": to_float(r.get("Bonus_Accrued")),
                 "bonus_paid": to_float(r.get("Bonus_Paid")),
                 "bonus_to_dep": to_float(r.get("Bonus_To_Deposit")),
-                "last_upd": r.get("Last_Update") or ""
+                "w_addr": (r.get("Wallet_Address") or "").strip(),
+                "w_net": (r.get("Wallet_Network") or "").strip().upper(),
+                "w_p_addr": (r.get("Wallet_Pending_Address") or "").strip(),
+                "w_p_net": (r.get("Wallet_Pending_Network") or "").strip().upper(),
+                "updated": (r.get("Last_Update") or "").strip(),
             })
         except Exception as e:
-            log.warning(f"Skipping invalid user row {r}: {e}")
+            log.warning(f"Skipping invalid user row: {r} err={e}")
     return res
 
-def find_user_row(chat_id: int) -> Optional[int]:
+def find_user_row_idx(chat_id: int) -> Optional[int]:
     w = ws(USERS_SHEET)
     try:
         cell = w.find(str(chat_id), in_column=1)
         if cell: return cell.row
     except Exception:
         pass
-    # fallback scan
+    # fallback
     try:
         col = w.col_values(1)
         for i, v in enumerate(col, start=1):
@@ -185,7 +257,7 @@ def find_user_row(chat_id: int) -> Optional[int]:
         pass
     return None
 
-def upsert_user(
+def upsert_user_row(
     chat_id: int,
     name: Optional[str] = None,
     deposit: Optional[float] = None,
@@ -194,318 +266,418 @@ def upsert_user(
     bonus_acc: Optional[float] = None,
     bonus_paid: Optional[float] = None,
     bonus_to_dep: Optional[float] = None,
-    touch_update: bool = True
+    w_addr: Optional[str] = None,
+    w_net: Optional[str] = None,
+    w_p_addr: Optional[str] = None,
+    w_p_net: Optional[str] = None,
 ):
     w = ws(USERS_SHEET)
-    row = find_user_row(chat_id)
-    now = now_utc_str() if touch_update else ""
-
-    # read current
-    cur = {}
-    if row:
-        cur_vals = w.row_values(row)
-        for i, col in enumerate(USERS_COLS, start=1):
-            cur[col] = cur_vals[i-1] if i-1 < len(cur_vals) else ""
-
-    def pick(v, key, default=""):
-        return cur.get(key, default) if v is None else v
-
-    data = {
-        "Chat_ID": str(chat_id),
-        "Name": pick(name, "Name", ""),
-        "Deposit_USDT": str(pick(deposit, "Deposit_USDT", "0")),
-        "Active": ("TRUE" if (pick(active, "Active", "TRUE") in (True, "TRUE")) else "FALSE") if isinstance(pick(active, "Active", "TRUE"), (bool,)) else pick(active, "Active", "TRUE"),
-        "Pending_Deposit": str(pick(pending, "Pending_Deposit", "0")),
-        "Bonus_Accrued": str(pick(bonus_acc, "Bonus_Accrued", "0")),
-        "Bonus_Paid": str(pick(bonus_paid, "Bonus_Paid", "0")),
-        "Bonus_To_Deposit": str(pick(bonus_to_dep, "Bonus_To_Deposit", "0")),
-        "Last_Update": now or cur.get("Last_Update", "")
-    }
-
-    # normalize bool
-    if isinstance(active, bool):
-        data["Active"] = "TRUE" if active else "FALSE"
-
-    # write
-    row_values = [data[c] for c in USERS_COLS]
-    end_col = chr(ord('A') + len(USERS_COLS) - 1)
-    if row:
-        ws(USERS_SHEET).update(f"A{row}:{end_col}{row}", [row_values])
+    headers = w.row_values(1)
+    idx = {h: i for i, h in enumerate(headers)}
+    row_idx = find_user_row_idx(chat_id)
+    def get(row_vals, h, default=""):
+        return row_vals[idx[h]] if (h in idx and idx[h] < len(row_vals)) else default
+    now = now_utc_str()
+    if row_idx:
+        cur = w.row_values(row_idx)
+        values = {h: get(cur, h, "") for h in headers}
+        # apply changes
+        if name is not None: values["Name"] = name
+        if deposit is not None: values["Deposit_USDT"] = str(deposit)
+        if active is not None: values["Active"] = "TRUE" if active else "FALSE"
+        if pending is not None: values["Pending_Deposit"] = str(pending)
+        if bonus_acc is not None: values["Bonus_Accrued"] = str(bonus_acc)
+        if bonus_paid is not None: values["Bonus_Paid"] = str(bonus_paid)
+        if bonus_to_dep is not None: values["Bonus_To_Deposit"] = str(bonus_to_dep)
+        if w_addr is not None: values["Wallet_Address"] = w_addr
+        if w_net is not None: values["Wallet_Network"] = w_net
+        if w_p_addr is not None: values["Wallet_Pending_Address"] = w_p_addr
+        if w_p_net is not None: values["Wallet_Pending_Network"] = w_p_net
+        values["Last_Update"] = now
+        row = [values.get(h, "") for h in headers]
+        w.update(f"A{row_idx}:{chr(64+len(headers))}{row_idx}", [row])
     else:
-        ws(USERS_SHEET).append_row(row_values, value_input_option="RAW")
+        row = {
+            "Chat_ID": str(chat_id),
+            "Name": name or "",
+            "Deposit_USDT": str(deposit or 0),
+            "Active": "FALSE" if (active is False) else "TRUE",
+            "Pending_Deposit": str(pending or 0),
+            "Bonus_Accrued": str(bonus_acc or 0),
+            "Bonus_Paid": str(bonus_paid or 0),
+            "Bonus_To_Deposit": str(bonus_to_dep or 0),
+            "Wallet_Address": w_addr or "",
+            "Wallet_Network": (w_net or "").upper(),
+            "Wallet_Pending_Address": w_p_addr or "",
+            "Wallet_Pending_Network": (w_p_net or "").upper(),
+            "Wallet_Updated_UTC": "",
+            "Last_Update": now
+        }
+        w.append_row([row.get(h, "") for h in headers], value_input_option="RAW")
 
-def adjust_user_bonus(chat_id: int, delta_acc=0.0, delta_paid=0.0, delta_to_dep=0.0):
-    users = get_users()
-    u = next((x for x in users if x["chat_id"] == chat_id), None)
-    if not u:
-        # создать черновик
-        upsert_user(chat_id, deposit=0, active=False)
-        u = {"bonus_acc":0.0,"bonus_paid":0.0,"bonus_to_dep":0.0}
-    upsert_user(
-        chat_id,
-        bonus_acc = u["bonus_acc"] + delta_acc,
-        bonus_paid= u["bonus_paid"] + delta_paid,
-        bonus_to_dep = u["bonus_to_dep"] + delta_to_dep
-    )
-
-def bonus_available(u: Dict[str, Any]) -> float:
-    return max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
-
-def append_ledger(op_type: str, chat_id: int, name: str, amount: float, note: str = "", admin: str = "", status: str = ""):
+def append_ledger(**kwargs):
     w = ws(LEDGER_SHEET)
-    w.append_row([
-        now_utc_str(), op_type, str(chat_id), name or "", f"{amount:.2f}", note or "", admin or "", status or ""
-    ], value_input_option="RAW")
+    headers = w.row_values(1)
+    row = [str(kwargs.get(h, "")) for h in headers]
+    # если каких-то полей нет — заполним динамически по совпадению ключей
+    for k, v in kwargs.items():
+        if k not in headers:
+            headers.append(k)
+            # расширим лист + заголовок
+            w.resize(cols=len(headers))
+            w.update(f"A1:{chr(64+len(headers))}1", [headers])
+            row.append(str(v))
+    w.append_row(row, value_input_option="RAW")
 
-# ------------------- Misc helpers -------------------
-def fmt_usd(x): 
+# ------------------- расчёт годовых -------------------
+def annual_forecast(user_bonus_total: float, start_utc: str, user_deposit: float) -> Tuple[float, float]:
     try:
-        return f"{float(x):,.2f}".replace(",", " ")
+        start_dt = datetime.strptime(start_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
-        return str(x)
+        return 0.0, 0.0
+    days = max((datetime.now(timezone.utc) - start_dt).total_seconds() / 86400.0, 1)
+    if user_deposit <= 0:
+        return 0.0, 0.0
+    annual_pct = (user_bonus_total / user_deposit) * (365.0 / days) * 100.0
+    return annual_pct, user_deposit * annual_pct / 100.0
 
-def base_from_pair(pair: str) -> str:
-    base = (pair or "").split("/")[0].split(":")[0].upper()
-    return base[:-1] if base.endswith("C") and len(base) > 3 else base
-
-def parse_money(s: str) -> float:
-    return float(re.sub(r"[^\d.,\-]", "", s).replace(",", "."))
-
-def parse_setdep_text(text: str):
-    m = re.match(r"^/setdep\s+(-?\d+)\s+([0-9][\d\s.,]*)\s*(?:\((bonus)\))?\s*$", text.strip(), re.I)
-    if not m: return None
-    return int(m.group(1)), parse_money(m.group(2)), (m.group(3) == "bonus")
-
-open_positions: Dict[str, Dict[str, Any]] = {}  # Signal_ID -> {cum_margin, recipients: [chat_ids]}
-
-def annual_forecast_user(bonus_acc: float, start_utc: str, deposit: float) -> (float, float):
-    try: start_dt = datetime.strptime(start_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError): return 0.0, 0.0
-    days_passed = (datetime.now(timezone.utc) - start_dt).total_seconds() / (24 * 3600)
-    days = max(days_passed, 1.0)
-    if deposit <= 0: return 0.0, 0.0
-    annual_pct = (bonus_acc / deposit) * (365.0 / days) * 100.0
-    return annual_pct, deposit * annual_pct / 100.0
-
-# ------------------- Telegram: role helpers -------------------
-def is_admin(update: Update) -> bool:
-    uid = update.effective_user.id if update.effective_user else None
-    cid = update.effective_chat.id if update.effective_chat else None
-    return (uid in ADMIN_IDS) or (cid in ADMIN_IDS)
-
-def user_status_label(u: Optional[Dict[str, Any]]) -> str:
-    if not u: return "новый"
-    return "активный" if u["active"] else "неактивный"
-
-# ------------------- User commands -------------------
+# ------------------- Telegram: тексты -------------------
 START_TEXT = (
     "👋 Привет! Я <b>STRIGI_KAPUSTU_BOT</b>.\n\n"
     "Чтобы начать:\n"
-    "1) Отправьте команду <code>/myname Имя Фамилия</code>\n"
+    "1) Отправьте команду: <code>/myname Имя Фамилия</code>\n"
     "2) Переведите USDT на адрес:\n"
     "   <code>TVSRhKYHAUKx8RnXzW3KXNeUk5aAQs7hJ4</code>\n"
-    "   (сеть TRON, TRC-20).\n"
-    "3) Отправьте команду:\n"
-    "   <code>/add_deposit 500</code>\n"
-    "   (укажите сумму вашего перевода).\n"
-    "4) Дождитесь подтверждения — депозит активируется со следующей сделкой.\n"
-    "5) Проверяйте состояние в любой момент: <code>/balance</code>\n\n"
+    "   (сеть <b>TRON / TRC-20</b>)\n"
+    "3) Отправьте команду: <code>/add_deposit 500</code> (укажите сумму перевода)\n"
+    "4) Дождитесь подтверждения — депозит активируется со следующей сделкой\n"
+    "5) Проверяйте состояние: <b>/balance</b>\n\n"
+    "💼 Для выводов заранее сохраните кошелёк: <code>/setwallet &lt;адрес&gt; TRC20</code>\n\n"
     "Дополнительно:\n"
     "• Пополнить из премии: <code>/add_from_bonus 100</code>\n"
     "• Вывод премии: <code>/withdraw_bonus 100</code> (или <code>all</code>)\n"
-    "• Вывод всего депозита: <code>/withdraw_all</code>"
+    "• Вывод всего депозита: <b>/withdraw_all</b>\n"
 )
 
 ABOUT_TEXT = (
     "🤖 <b>О боте</b>\n\n"
-    "Это инвестиционный бот, который ведёт алгоритмическую торговлю Евро ↔ Доллар через стейблкоины (EURC/USDT) на бирже.\n"
+    "Это инвестиционный бот, который ведёт алгоритмическую торговлю Евро ↔ Доллар через стейблкоины (EURC/USDT) на бирже. "
     "Алгоритм автоматически управляет входами, доборами и выходами, присылает уведомления и ведёт учёт сделок.\n\n"
     "📈 <b>Модель дохода</b>\n"
-    "В отчётах вам отображается прибыль только закрытых сделок — это ваша «премия».\n"
+    "В отчётах вам отображается прибыль только закрытых сделок — это ваша «премия». "
     "Её можно вывести (<code>/withdraw_bonus</code>) или реинвестировать (<code>/add_from_bonus</code>).\n\n"
     "⚠️ <b>Дисклеймер о рисках</b>\n"
     "Торговля на рынке (в т.ч. с плечом) связана с высокой волатильностью и может привести к частичной или полной потере средств. "
     "Прошлые результаты не гарантируют будущую доходность. Используя бота, вы подтверждаете, что понимаете и принимаете эти риски."
 )
 
+# ------------------- Telegram handlers: Users -------------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid, cid = update.effective_user.id, update.effective_chat.id
-    await set_menu_user(ctx.application, cid)
     await update.message.reply_text(START_TEXT, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
 async def about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(ABOUT_TEXT, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
 async def myname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    args = ctx.args
-    name = " ".join(args).strip() if args else ""
+    chat_id = update.effective_chat.id
+    name = (update.message.text or "").replace("/myname", "", 1).strip()
     if not name:
         return await update.message.reply_text("Укажите имя: <code>/myname Имя Фамилия</code>", parse_mode=constants.ParseMode.HTML)
-    # создать/обновить пользователя
-    u_all = get_users()
-    u = next((x for x in u_all if x["chat_id"] == cid), None)
-    was_new = (u is None)
-    upsert_user(cid, name=name, deposit=(u["deposit"] if u else 0.0), active=(u["active"] if u else False))
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
+    if not u:
+        upsert_user_row(chat_id, name=name, active=False)  # новый пользователь
+        status = "новый"
+    else:
+        upsert_user_row(chat_id, name=name)
+        status = "активный" if u["active"] else "новый"
     await update.message.reply_text(f"✅ Имя сохранено: <b>{name}</b>", parse_mode=constants.ParseMode.HTML)
-    # уведомление админу
-    status = user_status_label(u)
+    # уведомим админов
     for aid in ADMIN_IDS:
         try:
             await ctx.application.bot.send_message(
-                aid, f"👤 Пользователь обновил имя: <b>{name}</b> (chat_id <code>{cid}</code>), статус: <b>{status}</b>",
+                chat_id=aid,
+                text=f"👤 NEW/UPDATE NAME\nПользователь: <b>{name}</b> (id <code>{chat_id}</code>, {status})",
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             log.warning(f"notify admin name failed: {e}")
 
-async def add_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    try:
-        amt = parse_money(" ".join(ctx.args))
-        if amt <= 0: raise ValueError
-    except Exception:
-        return await update.message.reply_text("Использование: <code>/add_deposit 500</code>", parse_mode=constants.ParseMode.HTML)
+async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     users = get_users()
-    u = next((x for x in users if x["chat_id"] == cid), None)
-    if not u:
-        upsert_user(cid, name="", deposit=0.0, active=False)
-        u = next((x for x in get_users() if x["chat_id"] == cid), None)
-    upsert_user(cid, pending=amt)  # применится на следующем OPEN
-    append_ledger("DEPOSIT_REQUEST", cid, u["name"], amt, note="user requested external deposit")
-    await update.message.reply_text(
-        f"📨 Заявка на пополнение <b>{fmt_usd(amt)}</b> USDT отправлена админу.\n"
-        f"После подтверждения депозит будет учтён со следующей сделкой. Проверьте: /balance",
-        parse_mode=constants.ParseMode.HTML
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
+    if not u or not u["active"]:
+        return await update.message.reply_text("Вы ещё не подключены. Отправьте /start и передайте ваш chat_id админу.")
+    # доступная премия = начислено - выплачено - переведено в депозит
+    bonus_avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+    # кошелёк
+    wallet_line = "—"
+    if u["w_addr"]:
+        wallet_line = f"{u['w_addr']} / {u['w_net'] or 'TRC20'}"
+    elif u["w_p_addr"]:
+        wallet_line = f"(в ожидании) {u['w_p_addr']} / {u['w_p_net'] or 'TRC20'}"
+    # итог
+    txt = (
+        f"🧰 <b>Баланс</b>\n\n"
+        f"Депозит: <b>${fmt_usd(u['deposit'])}</b>\n"
+        f"Премия (начислено): <b>${fmt_usd(u['bonus_acc'])}</b>\n"
+        f"— выплачено: <b>${fmt_usd(u['bonus_paid'])}</b>\n"
+        f"— переведено в депозит: <b>${fmt_usd(u['bonus_to_dep'])}</b>\n"
+        f"Доступно к выводу: <b>${fmt_usd(bonus_avail)}</b>\n\n"
+        f"Кошелёк для выводов: <b>{wallet_line}</b>"
     )
-    # админу
-    status = user_status_label(u)
+    await update.message.reply_text(txt, parse_mode=constants.ParseMode.HTML)
+
+async def add_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = (ctx.args or [])
+    if not args:
+        return await update.message.reply_text("Использование: <code>/add_deposit 500</code>", parse_mode=constants.ParseMode.HTML)
+    try:
+        add = parse_money(args[0])
+        if add != add or add <= 0:  # NaN или <=0
+            raise ValueError
+    except Exception:
+        return await update.message.reply_text("Сумма некорректна. Пример: <code>/add_deposit 500</code>", parse_mode=constants.ParseMode.HTML)
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
+    if not u:
+        # создадим карточку пользователя (не активен)
+        upsert_user_row(chat_id, name=str(chat_id), active=False, pending=add)
+        current_dep = 0.0
+        status = "новый"
+        name = str(chat_id)
+    else:
+        current_dep = u["deposit"]
+        name = u["name"] or str(chat_id)
+        # Pending трактуем как целевой депозит (текущий + добавка)
+        upsert_user_row(chat_id, pending=current_dep + add)
+        status = "активный" if u["active"] else "новый"
+    append_ledger(
+        **{
+            "Timestamp_UTC": now_utc_str(), "Type": "DEPOSIT_ADD_REQUEST", "Chat_ID": chat_id,
+            "Name": name, "Amount_USDT": add, "Note": "Заявка на добавление депозита", "Status": "PENDING"
+        }
+    )
+    await update.message.reply_text("📨 Заявка на пополнение депозита отправлена админу. Депозит активируется со следующей сделкой.")
+    # уведомление админам + подсказка команды
     for aid in ADMIN_IDS:
         try:
+            cmd = f"/setdep {chat_id} {current_dep + add:.2f}"
             await ctx.application.bot.send_message(
-                aid,
-                f"🧾 Заявка на пополнение: +<b>{fmt_usd(amt)}</b> USDT от <b>{u['name'] or cid}</b> "
-                f"(chat_id <code>{cid}</code>), статус: <b>{status}</b>\n"
-                f"Подсказка: новый → <code>/adduser {cid} {u['name'] or cid} {amt}</code>, активный → <code>/setdep {cid} {amt}</code>",
+                chat_id=aid,
+                text=(f"💵 DEPOSIT_ADD_REQUEST\n"
+                      f"Пользователь: <b>{name}</b> (id <code>{chat_id}</code>, {status})\n"
+                      f"Текущий депозит: ${fmt_usd(current_dep)}\n"
+                      f"Запрошено добавить: ${fmt_usd(add)}\n"
+                      f"👉 Применить со след. сделки: <code>{cmd}</code>"),
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             log.warning(f"notify admin add_deposit failed: {e}")
 
 async def add_from_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    try:
-        amt = parse_money(" ".join(ctx.args))
-        if amt <= 0: raise ValueError
-    except Exception:
+    chat_id = update.effective_chat.id
+    args = (ctx.args or [])
+    if not args:
         return await update.message.reply_text("Использование: <code>/add_from_bonus 100</code>", parse_mode=constants.ParseMode.HTML)
-    u = next((x for x in get_users() if x["chat_id"] == cid), None)
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
     if not u:
-        return await update.message.reply_text("Сначала укажите имя (/myname) и пополните депозит (/add_deposit).")
-    avail = bonus_available(u)
-    append_ledger("BONUS_REINVEST_REQUEST", cid, u["name"], amt, note=f"available={avail:.2f}")
-    await update.message.reply_text(
-        f"📨 Заявка на пополнение из премии <b>{fmt_usd(amt)}</b> USDT отправлена админу.\n"
-        f"После подтверждения сумма будет добавлена со следующей сделкой.",
-        parse_mode=constants.ParseMode.HTML
+        return await update.message.reply_text("Сначала укажите имя /myname и добавьте депозит /add_deposit.")
+    try:
+        req = parse_money(args[0])
+        bonus_avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+        amount = bonus_avail if (req != req) else req  # NaN => all
+        if amount <= 0 or amount > bonus_avail + 1e-9:
+            raise ValueError
+    except Exception:
+        return await update.message.reply_text(f"Недостаточно средств. Доступно из премии: ${fmt_usd(max(0.0, u['bonus_acc']-u['bonus_paid']-u['bonus_to_dep']))}")
+    target_dep = u["deposit"] + amount
+    upsert_user_row(chat_id, pending=target_dep)
+    append_ledger(
+        **{
+            "Timestamp_UTC": now_utc_str(), "Type": "BONUS_TO_DEPOSIT_REQUEST", "Chat_ID": chat_id,
+            "Name": u["name"] or str(chat_id), "Amount_USDT": amount, "Note": "Премия в депозит", "Status": "PENDING"
+        }
     )
-    status = user_status_label(u)
+    await update.message.reply_text("📨 Заявка на пополнение из премии отправлена админу. Изменение вступит со следующей сделкой.")
     for aid in ADMIN_IDS:
         try:
+            cmd = f"/apply_from_bonus {chat_id} {amount:.2f}"
+            cmd2 = f"/setdep {chat_id} {target_dep:.2f}"
             await ctx.application.bot.send_message(
-                aid,
-                f"🧾 Заявка из премии: +<b>{fmt_usd(amt)}</b> USDT от <b>{u['name'] or cid}</b> "
-                f"(chat_id <code>{cid}</code>), статус: <b>{status}</b>, доступно: <b>{fmt_usd(avail)}</b>\n"
-                f"Подсказка: подтвердить как реинвест → <code>/setdep {cid} {amt} (bonus)</code>",
+                chat_id=aid,
+                text=(f"💼 BONUS_TO_DEPOSIT_REQUEST\n"
+                      f"Пользователь: <b>{u['name'] or chat_id}</b> (id <code>{chat_id}</code>, {'активный' if u['active'] else 'новый'})\n"
+                      f"Доступно из премии: ${fmt_usd(max(0.0,u['bonus_acc']-u['bonus_paid']-u['bonus_to_dep']))}\n"
+                      f"Запрошено перевести: ${fmt_usd(amount)}\n"
+                      f"👉 Списать из премии: <code>{cmd}</code>\n"
+                      f"👉 Обновить депозит со след. сделки: <code>{cmd2}</code>"),
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             log.warning(f"notify admin add_from_bonus failed: {e}")
 
 async def withdraw_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if not ctx.args:
+    chat_id = update.effective_chat.id
+    args = (ctx.args or [])
+    if not args:
         return await update.message.reply_text("Использование: <code>/withdraw_bonus 100</code> или <code>/withdraw_bonus all</code>", parse_mode=constants.ParseMode.HTML)
-    arg = ctx.args[0].strip().lower()
-    u = next((x for x in get_users() if x["chat_id"] == cid), None)
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
     if not u:
-        return await update.message.reply_text("Вы ещё не подключены. Отправьте /start и следуйте инструкции.")
-    avail = bonus_available(u)
-    if arg == "all":
-        amt = avail
-    else:
-        try:
-            amt = parse_money(arg)
-        except Exception:
-            return await update.message.reply_text("Неверная сумма. Пример: <code>/withdraw_bonus 150</code> или <code>all</code>", parse_mode=constants.ParseMode.HTML)
-    if amt <= 0:
-        return await update.message.reply_text("Доступной премии нет к выводу.")
-    append_ledger("BONUS_WITHDRAW_REQUEST", cid, u["name"], amt, note=f"available={avail:.2f}")
-    await update.message.reply_text(
-        f"📨 Заявка на вывод премии (<b>{'all' if arg=='all' else fmt_usd(amt)}</b>) отправлена админу.",
-        parse_mode=constants.ParseMode.HTML
+        return await update.message.reply_text("Сначала укажите имя /myname и добавьте депозит /add_deposit.")
+    # проверим кошелёк
+    if not u["w_addr"]:
+        return await update.message.reply_text("⚠️ Кошелёк для выводов не указан. Установите: <code>/setwallet &lt;адрес&gt; TRC20</code>", parse_mode=constants.ParseMode.HTML)
+    try:
+        req = parse_money(args[0])
+        bonus_avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+        amount = bonus_avail if (req != req) else req  # NaN => all
+        if amount <= 0 or amount > bonus_avail + 1e-9:
+            raise ValueError
+    except Exception:
+        return await update.message.reply_text(f"Недостаточно средств. Доступно к выводу: ${fmt_usd(max(0.0,u['bonus_acc']-u['bonus_paid']-u['bonus_to_dep']))}")
+    append_ledger(
+        **{
+            "Timestamp_UTC": now_utc_str(), "Type": "WITHDRAW_BONUS_REQUEST", "Chat_ID": chat_id,
+            "Name": u["name"] or str(chat_id), "Amount_USDT": amount,
+            "Note": f"Вывод премии на {u['w_addr']} / {u['w_net'] or 'TRC20'}", "Status": "PENDING"
+        }
     )
-    status = user_status_label(u)
+    await update.message.reply_text("📨 Заявка на вывод премии отправлена админу. Ожидайте подтверждения.")
     for aid in ADMIN_IDS:
         try:
+            cmd = f"/pay_bonus {chat_id} {amount:.2f}"
             await ctx.application.bot.send_message(
-                aid,
-                f"🧾 Заявка на вывод премии: <b>{'all' if arg=='all' else fmt_usd(amt)}</b> от <b>{u['name'] or cid}</b> "
-                f"(chat_id <code>{cid}</code>), статус: <b>{status}</b>, доступно: <b>{fmt_usd(avail)}</b>",
+                chat_id=aid,
+                text=(f"💸 WITHDRAW_BONUS_REQUEST\n"
+                      f"Пользователь: <b>{u['name'] or chat_id}</b> (id <code>{chat_id}</code>, {'активный' if u['active'] else 'новый'})\n"
+                      f"Сумма: ${fmt_usd(amount)}\n"
+                      f"Кошелёк: {u['w_addr']} / {u['w_net'] or 'TRC20'}\n"
+                      f"👉 Выплатить: <code>{cmd}</code>"),
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             log.warning(f"notify admin withdraw_bonus failed: {e}")
 
 async def withdraw_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    u = next((x for x in get_users() if x["chat_id"] == cid), None)
+    chat_id = update.effective_chat.id
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
     if not u:
-        return await update.message.reply_text("Вы ещё не подключены. Отправьте /start и следуйте инструкции.")
-    avail = bonus_available(u)
-    total_payout = u["deposit"] + avail
-    append_ledger("WITHDRAW_ALL_REQUEST", cid, u["name"], total_payout, note=f"deposit={u['deposit']:.2f}, bonus_avail={avail:.2f}")
-    await update.message.reply_text("📨 Заявка на вывод всего депозита и премии отправлена админу. После перевода учётная запись будет отключена.", parse_mode=constants.ParseMode.HTML)
-    status = user_status_label(u)
+        return await update.message.reply_text("Вы ещё не подключены. Отправьте /start и передайте ваш chat_id админу.")
+    if not u["w_addr"]:
+        return await update.message.reply_text("⚠️ Кошелёк для выводов не указан. Установите: <code>/setwallet &lt;адрес&gt; TRC20</code>", parse_mode=constants.ParseMode.HTML)
+    bonus_avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+    total = u["deposit"] + bonus_avail
+    append_ledger(
+        **{
+            "Timestamp_UTC": now_utc_str(), "Type": "WITHDRAW_ALL_REQUEST", "Chat_ID": chat_id,
+            "Name": u["name"] or str(chat_id), "Amount_USDT": total,
+            "Note": f"Вывод депозита+премии на {u['w_addr']} / {u['w_net'] or 'TRC20'}", "Status": "PENDING"
+        }
+    )
+    await update.message.reply_text("📨 Заявка на вывод депозита и премии отправлена админу. После обработки вы будете отключены.")
     for aid in ADMIN_IDS:
         try:
+            cmd = f"/pay_all {chat_id}"
             await ctx.application.bot.send_message(
-                aid,
-                f"🧾 Заявка на вывод ВСЕГО от <b>{u['name'] or cid}</b> (chat_id <code>{cid}</code>), статус: <b>{status}</b>.\n"
-                f"К выплате ориентировочно: депозит <b>{fmt_usd(u['deposit'])}</b> + премия <b>{fmt_usd(avail)}</b> = <b>{fmt_usd(total_payout)}</b>.",
+                chat_id=aid,
+                text=(f"🏁 WITHDRAW_ALL_REQUEST\n"
+                      f"Пользователь: <b>{u['name'] or chat_id}</b> (id <code>{chat_id}</code>, {'активный' if u['active'] else 'новый'})\n"
+                      f"К выплате: депозит ${fmt_usd(u['deposit'])} + премия ${fmt_usd(bonus_avail)} = <b>${fmt_usd(total)}</b>\n"
+                      f"Кошелёк: {u['w_addr']} / {u['w_net'] or 'TRC20'}\n"
+                      f"👉 Выплатить и отключить: <code>{cmd}</code>"),
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             log.warning(f"notify admin withdraw_all failed: {e}")
 
-async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    u = next((x for x in get_users() if x["chat_id"] == cid and x["active"]), None)
-    if not u:
-        return await update.message.reply_text("Вы ещё не подключены. Отправьте /start и передайте ваш chat_id админу.")
-    _, start_utc, _ = get_state()
-    avail = bonus_available(u)
-    ann_pct, ann_usd = annual_forecast_user(u["bonus_acc"], start_utc, u["deposit"])
-    await update.message.reply_text(
-        f"🧰 <b>Баланс</b>\n\n"
-        f"Депозит: <b>${fmt_usd(u['deposit'])}</b>\n"
-        f"Премия (накоплено): <b>${fmt_usd(u['bonus_acc'])}</b>\n"
-        f"— выплачено: <b>${fmt_usd(u['bonus_paid'])}</b>, реинвестировано: <b>${fmt_usd(u['bonus_to_dep'])}</b>\n"
-        f"Доступно к выводу: <b>${fmt_usd(avail)}</b>\n\n"
-        f"Оценка годовых к депозиту {fmt_usd(u['deposit'])}: ~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год).",
-        parse_mode=constants.ParseMode.HTML
-    )
+# ------------------- кошельки (user) -------------------
+def guess_net(addr: str) -> str:
+    a = (addr or "").strip()
+    if a.startswith("0x") and len(a) == 42: return "ERC20"
+    if a.startswith("T") and 30 <= len(a) <= 36: return "TRC20"
+    if a.startswith(("EQ","UQ")): return "TON"
+    return "TRC20"
 
-# ------------------- Admin commands -------------------
+async def mywallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
+    if not u:
+        return await update.message.reply_text("Кошелёк не задан. Установите: <code>/setwallet &lt;адрес&gt; [сеть]</code>", parse_mode=constants.ParseMode.HTML)
+    if u["w_addr"]:
+        txt = (f"💼 Текущий кошелёк для выводов:\n"
+               f"<code>{u['w_addr']}</code> / <b>{u['w_net'] or 'TRC20'}</b>\n"
+               f"Сменить: <code>/setwallet &lt;адрес&gt; [сеть]</code> или очистить <code>/clearwallet</code>.")
+    else:
+        pend = f"(ожидание) {u['w_p_addr']} / {u['w_p_net']}" if u["w_p_addr"] else "—"
+        txt = (f"⚠️ Кошелёк не указан.\n"
+               f"Установите: <code>/setwallet &lt;адрес&gt; [сеть]</code> (по умолчанию TRC20)\n"
+               f"Текущая заявка: {pend}")
+    await update.message.reply_text(txt, parse_mode=constants.ParseMode.HTML)
+
+async def setwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = ctx.args or []
+    if not args:
+        return await update.message.reply_text("Использование: <code>/setwallet TVS… TRC20</code>", parse_mode=constants.ParseMode.HTML)
+    addr = args[0].strip()
+    net  = (args[1].strip().upper() if len(args) >= 2 else guess_net(addr))
+    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
+    if not u:
+        upsert_user_row(chat_id, name=str(chat_id), active=False, w_p_addr=addr, w_p_net=net)
+        name = str(chat_id); status = "новый"
+    else:
+        upsert_user_row(chat_id, w_p_addr=addr, w_p_net=net)
+        name = u["name"] or str(chat_id); status = "активный" if u["active"] else "новый"
+    append_ledger(**{
+        "Timestamp_UTC": now_utc_str(), "Type": "WALLET_SET_REQUEST",
+        "Chat_ID": chat_id, "Name": name, "Old_Address": u["w_addr"] if u else "",
+        "Old_Network": u["w_net"] if u else "", "New_Address": addr, "New_Network": net, "Status": "PENDING"
+    })
+    await update.message.reply_text("📨 Заявка на установку кошелька отправлена админу.")
+    for aid in ADMIN_IDS:
+        try:
+            await ctx.application.bot.send_message(
+                chat_id=aid,
+                text=(f"📨 WALLET_SET_REQUEST\n"
+                      f"Пользователь: <b>{name}</b> (id <code>{chat_id}</code>, {status})\n"
+                      f"Старый: {u['w_addr'] if u else ''} / {u['w_net'] if u else ''}\n"
+                      f"Новый: {addr} / {net}\n"
+                      f"👉 Подтвердить: <code>/approve_wallet {chat_id}</code>\n"
+                      f"👉 Отклонить: <code>/reject_wallet {chat_id} причина</code>"),
+                parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            log.warning(f"notify admin wallet failed: {e}")
+
+async def clearwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
+    if not u:
+        return await update.message.reply_text("Вы ещё не подключены. Отправьте /start.")
+    upsert_user_row(chat_id, w_p_addr="", w_p_net="")
+    await update.message.reply_text("Заявка на очистку кошелька отправлена админу. (Отклоните/подтвердите через /reject_wallet или /approve_wallet)")
+
+# ------------------- Telegram handlers: Admin -------------------
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     text = (
         "Админ-команды:\n"
-        "/adduser <chat_id> <Имя (можно с пробелами)> <депозит>\n"
-        "/setdep <chat_id> <депозит> (со следующей сделкой) (доп. флаг: (bonus) — реинвест из премии)\n"
+        "/adduser <chat_id> <Имя> <депозит>\n"
+        "/setdep <chat_id> <депозит> (со след. сделки)\n"
         "/setname <chat_id> <Имя>\n"
         "/remove <chat_id>\n"
-        "/list"
+        "/list\n"
+        "/approve_wallet <chat_id>\n"
+        "/reject_wallet <chat_id> [причина]\n"
+        "/apply_from_bonus <chat_id> <сумма|all>\n"
+        "/pay_bonus <chat_id> <сумма|all>\n"
+        "/pay_all <chat_id>"
     )
     await update.message.reply_text(text)
 
@@ -517,254 +689,362 @@ async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id, dep = int(args[0]), parse_money(args[-1])
         name = " ".join(args[1:-1]).strip() or str(chat_id)
     except (ValueError, IndexError):
-        return await update.message.reply_text("Использование: /adduser <chat_id> <Имя (можно с пробелами)> <депозит>")
-    upsert_user(chat_id, name=name, deposit=dep, active=True, pending=0)
-    append_ledger("ADMIN_ADDUSER", chat_id, name, dep, admin=str(update.effective_user.id), status="applied")
-    await update.message.reply_text(f"OK. Пользователь {name} ({chat_id}) добавлен с депозитом {fmt_usd(dep)} USDT.")
+        return await update.message.reply_text("Использование: /adduser <chat_id> <Имя> <депозит>")
+    upsert_user_row(chat_id, name=name, deposit=dep, active=True)
+    await update.message.reply_text(f"OK. Пользователь {name} ({chat_id}) добавлен с депозитом ${fmt_usd(dep)}.")
     try:
         await set_menu_user(ctx.application, chat_id)
         await ctx.application.bot.send_message(
-            chat_id,
-            text=f"👋 Добро пожаловать, <b>{name}</b>! Ваш депозит: ${fmt_usd(dep)}.\nДепозит будет учтён со следующей сделкой.",
+            chat_id=chat_id,
+            text=f"👋 Добро пожаловать, <b>{name}</b>! Ваш депозит активирован: ${fmt_usd(dep)}.",
             parse_mode=constants.ParseMode.HTML
         )
     except Exception as e:
-        logging.warning(f"Не удалось отправить приветствие {chat_id}: {e}")
+        log.warning(f"greet adduser failed: {e}")
 
-def get_state():
-    w = ws(STATE_SHEET)
-    val_last_row, val_start_utc, val_profit_total = w.acell("A2").value, w.acell("B2").value, w.acell("C2").value
-    last_row = int(val_last_row) if (val_last_row or "").strip().isdigit() else 0
-    start_utc = val_start_utc or ""
-    profit_total = to_float(val_profit_total)
-    return last_row, start_utc, profit_total
-
-def set_state(last_row: Optional[int] = None, profit_total: Optional[float] = None, start_utc: Optional[str] = None):
-    w = ws(STATE_SHEET)
-    if last_row is not None: w.update_acell("A2", str(last_row))
-    if start_utc is not None: w.update_acell("B2", start_utc)
-    if profit_total is not None: w.update_acell("C2", f"{profit_total:.6f}")
+def _parse_setdep_text(text: str):
+    m = re.match(r"^/setdep\s+(-?\d+)\s+([0-9][\d\s.,]*)\s*$", (text or "").strip(), re.I)
+    if not m: return None
+    return int(m.group(1)), parse_money(m.group(2))
 
 async def setdep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    parsed = parse_setdep_text(update.message.text or "")
+    parsed = _parse_setdep_text(update.message.text)
     if not parsed:
-        return await update.message.reply_text("Использование: /setdep <chat_id> <депозит> (опц. (bonus))")
-    chat_id, dep, is_bonus = parsed
-    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
-    if not u:
-        return await update.message.reply_text("Пользователь не найден.")
-    # если это реинвест из премии — уменьшаем доступную премию и фиксируем как Bonus_To_Deposit
-    if is_bonus:
-        avail = bonus_available(u)
-        if dep > avail:
-            return await update.message.reply_text(f"Недостаточно премии. Доступно: {fmt_usd(avail)}")
-        adjust_user_bonus(chat_id, delta_to_dep=dep)  # зарезервировали под реинвест
-        append_ledger("ADMIN_BONUS_TO_DEP", chat_id, u["name"], dep, admin=str(update.effective_user.id), status="reserved_for_next_open")
-    upsert_user(chat_id, pending=dep)
-    await update.message.reply_text(f"OK. Pending-депозит {fmt_usd(dep)} USDT применится со следующей сделкой. {'(из премии)' if is_bonus else ''}")
+        return await update.message.reply_text("Использование: /setdep <chat_id> <депозит>")
+    chat_id, dep = parsed
+    upsert_user_row(chat_id, pending=dep)
+    await update.message.reply_text(f"OK. Pending-депозит ${fmt_usd(dep)} применится со следующей сделкой.")
+    try:
+        await ctx.application.bot.send_message(
+            chat_id=chat_id,
+            text=f"ℹ️ Ваш депозит будет установлен на ${fmt_usd(dep)} со следующей сделкой.",
+            parse_mode=constants.ParseMode.HTML
+        )
+    except Exception: pass
 
-async def setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def setname_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     try:
-        chat_id = int(ctx.args[0]); name = " ".join(ctx.args[1:])
+        chat_id = int(ctx.args[0]); name = " ".join(ctx.args[1:]).strip()
         if not name: raise ValueError
-    except (IndexError, ValueError): return await update.message.reply_text("Использование: /setname <chat_id> <Новое Имя>")
-    upsert_user(chat_id, name=name)
+    except (IndexError, ValueError):
+        return await update.message.reply_text("Использование: /setname <chat_id> <Новое Имя>")
+    upsert_user_row(chat_id, name=name)
     await update.message.reply_text("OK. Имя обновлено.")
 
 async def remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    try: chat_id = int(ctx.args[0])
-    except (IndexError, ValueError): return await update.message.reply_text("Использование: /remove <chat_id>")
-    upsert_user(chat_id, active=False)
-    append_ledger("ADMIN_REMOVE", chat_id, "", 0.0, admin=str(update.effective_user.id), status="deactivated")
+    try:
+        chat_id = int(ctx.args[0])
+    except (IndexError, ValueError):
+        return await update.message.reply_text("Использование: /remove <chat_id>")
+    upsert_user_row(chat_id, active=False)
     await update.message.reply_text("OK. Пользователь деактивирован.")
     try:
         await ctx.application.bot.set_my_commands([BotCommand("start", "Как подключиться"), BotCommand("about","О боте")], scope=BotCommandScopeChat(chat_id))
-    except Exception as e:
-        log.warning(f"set default menu for {chat_id} failed: {e}")
+    except Exception:
+        pass
 
 async def list_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     users = get_users()
-    if not users: return await update.message.reply_text("Список пуст.")
-    lines = [f"{'✅' if u['active'] else '⛔️'} {u['name'] or u['chat_id']} | dep={fmt_usd(u['deposit'])} | pending={fmt_usd(u['pending'])} | bonus_avail={fmt_usd(bonus_available(u))} | id={u['chat_id']}" for u in users]
+    if not users:
+        return await update.message.reply_text("Список пуст.")
+    lines = []
+    for u in users:
+        status = "✅ активный" if u["active"] else "🆕 новый/неактивный"
+        lines.append(f"{status} — {u['name'] or u['chat_id']} | dep={fmt_usd(u['deposit'])} | pend={fmt_usd(u['pending'])} | id={u['chat_id']}")
     await update.message.reply_text("\n".join(lines))
 
-# ------------------- Poller: сделки из лога -------------------
+async def approve_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    try:
+        chat_id = int(ctx.args[0])
+    except Exception:
+        return await update.message.reply_text("Использование: /approve_wallet <chat_id>")
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
+    if not u or not u["w_p_addr"]:
+        return await update.message.reply_text("Нет ожидающей заявки на кошелёк.")
+    # переносим pending -> активный
+    upsert_user_row(chat_id, w_addr=u["w_p_addr"], w_net=u["w_p_net"], w_p_addr="", w_p_net="")
+    append_ledger(**{
+        "Timestamp_UTC": now_utc_str(), "Type": "WALLET_SET_APPROVED",
+        "Chat_ID": chat_id, "Name": u["name"] or chat_id, "Old_Address": u["w_addr"], "Old_Network": u["w_net"],
+        "New_Address": u["w_p_addr"], "New_Network": u["w_p_net"], "Admin": update.effective_user.id, "Status": "OK"
+    })
+    await update.message.reply_text("OK. Кошелёк утверждён.")
+    try:
+        await ctx.application.bot.send_message(chat_id=chat_id, text=f"✅ Кошелёк утверждён: <code>{u['w_p_addr']}</code> / <b>{u['w_p_net']}</b>", parse_mode=constants.ParseMode.HTML)
+    except Exception: pass
+
+async def reject_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    try:
+        chat_id = int(ctx.args[0]); reason = " ".join(ctx.args[1:]).strip() or "—"
+    except Exception:
+        return await update.message.reply_text("Использование: /reject_wallet <chat_id> [причина]")
+    users = get_users()
+    u = next((x for x in users if x["chat_id"] == chat_id), None)
+    upsert_user_row(chat_id, w_p_addr="", w_p_net="")
+    append_ledger(**{
+        "Timestamp_UTC": now_utc_str(), "Type": "WALLET_SET_REJECTED",
+        "Chat_ID": chat_id, "Name": (u and (u["name"] or chat_id)) or chat_id,
+        "New_Address": (u and u["w_p_addr"]) or "", "New_Network": (u and u["w_p_net"]) or "",
+        "Admin": update.effective_user.id, "Status": "REJECT", "Note": reason
+    })
+    await update.message.reply_text("OK. Заявка отклонена.")
+    try:
+        await ctx.application.bot.send_message(chat_id=chat_id, text=f"❌ Заявка на кошелёк отклонена. Причина: {reason}")
+    except Exception: pass
+
+async def apply_from_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    try:
+        chat_id = int(ctx.args[0]); req = parse_money(ctx.args[1])
+    except Exception:
+        return await update.message.reply_text("Использование: /apply_from_bonus <chat_id> <сумма|all>")
+    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
+    if not u:
+        return await update.message.reply_text("Пользователь не найден.")
+    avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+    amount = avail if (req != req) else req
+    if amount <= 0 or amount > avail + 1e-9:
+        return await update.message.reply_text(f"Недостаточно средств. Доступно: ${fmt_usd(avail)}")
+    # учтём перевод в депозит (со след. сделки)
+    target_dep = u["deposit"] + amount
+    upsert_user_row(chat_id, pending=target_dep, bonus_to_dep=u["bonus_to_dep"] + amount)
+    append_ledger(**{
+        "Timestamp_UTC": now_utc_str(), "Type": "BONUS_TO_DEPOSIT_APPLIED", "Chat_ID": chat_id,
+        "Name": u["name"] or chat_id, "Amount_USDT": amount, "Admin": update.effective_user.id, "Status": "OK"
+    })
+    await update.message.reply_text(f"OK. Из премии переведено ${fmt_usd(amount)}. Pending депозит: ${fmt_usd(target_dep)}")
+
+async def pay_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    try:
+        chat_id = int(ctx.args[0]); req = parse_money(ctx.args[1])
+    except Exception:
+        return await update.message.reply_text("Использование: /pay_bonus <chat_id> <сумма|all>")
+    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
+    if not u:
+        return await update.message.reply_text("Пользователь не найден.")
+    avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+    amount = avail if (req != req) else req
+    if amount <= 0 or amount > avail + 1e-9:
+        return await update.message.reply_text(f"Недостаточно средств. Доступно: ${fmt_usd(avail)}")
+    upsert_user_row(chat_id, bonus_paid=u["bonus_paid"] + amount)
+    append_ledger(**{
+        "Timestamp_UTC": now_utc_str(), "Type": "BONUS_PAID",
+        "Chat_ID": chat_id, "Name": u["name"] or chat_id, "Amount_USDT": amount,
+        "Admin": update.effective_user.id, "Tx_Direction": "OUT", "Status": "OK",
+        "Note": f"to {u['w_addr']} / {u['w_net'] or 'TRC20'}"
+    })
+    await update.message.reply_text(f"OK. Выплачено ${fmt_usd(amount)} премии пользователю {u['name'] or chat_id}.")
+    try:
+        await ctx.application.bot.send_message(chat_id=chat_id, text=f"💸 Перевод отправлен: ${fmt_usd(amount)} (премия).")
+    except Exception: pass
+
+async def pay_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    try:
+        chat_id = int(ctx.args[0])
+    except Exception:
+        return await update.message.reply_text("Использование: /pay_all <chat_id>")
+    u = next((x for x in get_users() if x["chat_id"] == chat_id), None)
+    if not u:
+        return await update.message.reply_text("Пользователь не найден.")
+    bonus_avail = max(0.0, u["bonus_acc"] - u["bonus_paid"] - u["bonus_to_dep"])
+    amount = u["deposit"] + bonus_avail
+    # списываем всё: депозит -> 0, бонус_paid += bonus_avail, active=False
+    upsert_user_row(chat_id, deposit=0.0, active=False, bonus_paid=u["bonus_paid"] + bonus_avail)
+    append_ledger(**{
+        "Timestamp_UTC": now_utc_str(), "Type": "ALL_WITHDRAWN",
+        "Chat_ID": chat_id, "Name": u["name"] or chat_id, "Amount_USDT": amount,
+        "Admin": update.effective_user.id, "Tx_Direction": "OUT", "Status": "OK",
+        "Note": f"deposit+bonus to {u['w_addr']} / {u['w_net'] or 'TRC20'}"
+    })
+    await update.message.reply_text(f"OK. Выплачено ${fmt_usd(amount)} и пользователь отключён.")
+    try:
+        await ctx.application.bot.send_message(chat_id=chat_id, text=f"🏁 Перевод отправлен: ${fmt_usd(amount)} (депозит + премия). Вы отключены.")
+        # Сбросим меню на дефолт
+        await ctx.application.bot.set_my_commands([BotCommand("start","Как подключиться"), BotCommand("about","О боте")], scope=BotCommandScopeChat(chat_id))
+    except Exception: pass
+
+# ------------------- Trading log polling (30% модель) -------------------
+open_positions: Dict[str, Dict[str, Any]] = {}  # sid -> {cum_margin, snapshot: [(chat_id, deposit)], users:[ids]}
+
 async def send_all(app: Application, text_by_user: Dict[int, str]):
     for chat_id, text in text_by_user.items():
         if text.strip():
-            try: await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
-            except Exception as e: log.warning(f"send to {chat_id} failed: {e}")
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
+            except Exception as e:
+                log.warning(f"send to {chat_id} failed: {e}")
 
 async def poll_and_broadcast(app: Application):
     try:
-        last_row, start_utc, profit_total = get_state()
-        if not (start_utc or "").strip():
-            start_utc = now_utc_str()
-            set_state(start_utc=start_utc)
-        # читаем сделки
-        records = sheet_dicts(ws(LOG_SHEET))
-        total_rows_in_sheet = len(records) + 1
+        last_row, start_utc, profit30_total = get_state()
+        recs = sheet_dicts(ws(LOG_SHEET))
+        total_rows = len(recs) + 1
         if last_row == 0:
-            log.info(f"First run detected. Skipping {total_rows_in_sheet} historical records.")
-            set_state(last_row=total_rows_in_sheet, profit_total=0.0)
+            # первый запуск — пропускаем историю
+            set_state(last_row=total_rows, profit30_total=0.0, start_utc=start_utc or now_utc_str())
             return
-        if total_rows_in_sheet <= last_row: return
-        new_records = records[(last_row - 1):]
-
-        # активные пользователи на текущий момент (для OPEN будем брать их список)
+        if total_rows <= last_row:
+            return
+        new_records = recs[(last_row - 1):]
         users_all = get_users()
-        active_users_now = [u for u in users_all if u["active"]]
-
         per_user_msgs: Dict[int, List[str]] = {}
         def push(uid: int, text: str):
-            if not text: return
             per_user_msgs.setdefault(uid, []).append(text)
 
         for rec in new_records:
-            ev, sid = rec.get("Event") or "", rec.get("Signal_ID") or ""
+            ev = (rec.get("Event") or "").strip()
+            sid = (rec.get("Signal_ID") or "").strip()
             cum_margin = to_float(rec.get("Cum_Margin_USDT"))
             pnl_usd = to_float(rec.get("PNL_Realized_USDT"))
-            pair = rec.get("Pair","")
+            pair = rec.get("Pair", "")
 
-            # OPEN / ADD / RETEST_ADD: фиксируем пользователей сделки и применяем pending/реинвесты
-            if ev in ("OPEN", "ADD", "RETEST_ADD"):
-                # при первом OPEN сделки — применяем pending и переносим реинвесты (Bonus_To_Deposit)
-                if ev == "OPEN":
-                    # применим pending для всех активных
-                    updated_users = []
-                    for u in get_users():
-                        if not u["active"]: continue
-                        pend = u["pending"]
-                        if pend > 0:
-                            # если эта pending помечена как реинвест (мы зарезервировали через Bonus_To_Deposit)
-                            # её уже учли в Bonus_To_Deposit. Просто увеличим депозит и обнулим pending.
-                            upsert_user(u["chat_id"], deposit=u["deposit"] + pend, pending=0.0)
-                            append_ledger("PENDING_APPLIED", u["chat_id"], u["name"], pend, note="applied on OPEN")
-                            updated_users.append(u["chat_id"])
-                    # recipients = активные пользователи на момент открытия
-                    recipients = [u["chat_id"] for u in get_users() if u["active"]]
-                    open_positions[sid] = {"cum_margin": cum_margin, "recipients": recipients}
-
-                else:
-                    # обновим снимок
-                    snap = open_positions.setdefault(sid, {"cum_margin": 0.0, "recipients": []})
-                    snap["cum_margin"] = cum_margin
-
-                # уведомления пользователям сделки
-                snap = open_positions.get(sid, {})
-                recipients = snap.get("recipients", [])
-                if not recipients:
-                    continue
+            # Применяем pending депозиты при OPEN (для активных)
+            if ev == "OPEN":
+                users_all = get_users()  # свежий снимок
+                for u in users_all:
+                    if u["active"] and u["pending"] > 0:
+                        upsert_user_row(u["chat_id"], deposit=u["pending"], pending=0.0)
+                        u["deposit"], u["pending"] = u["pending"], 0.0
+                # snapshot активных пользователей (с их депозитами на момент открытия)
+                recipients = [u for u in users_all if u["active"] and u["deposit"] > 0]
+                open_positions[sid] = {
+                    "cum_margin": cum_margin,
+                    "snapshot": [(u["chat_id"], u["deposit"]) for u in recipients],
+                    "users": [u["chat_id"] for u in recipients]
+                }
                 used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
-                if ev == "OPEN":
-                    msg = f"📊 Сделка открыта. Задействовано {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
-                else:
-                    msg = f"🪙💵 Докупили {base_from_pair(pair)}. Объём в сделке: {used_pct:.1f}% банка ({fmt_usd(cum_margin)})."
-                for uid in recipients:
+                msg = (
+                    f"📊 Сделка открыта по <b>{base_from_pair(pair)}</b>. "
+                    f"Задействовано {used_pct:.1f}% банка (≈ ${fmt_usd(cum_margin)})."
+                )
+                for u in recipients:
+                    push(u["chat_id"], msg)
+
+            elif ev in ("ADD","RETEST_ADD"):
+                snap = open_positions.setdefault(sid, {"cum_margin": 0.0, "snapshot": [], "users": []})
+                snap["cum_margin"] = cum_margin
+                if not snap.get("users"):
+                    # fallback — если вдруг потеряли snapshot
+                    recipients = [u for u in users_all if u["active"] and u["deposit"] > 0]
+                    snap["users"] = [u["chat_id"] for u in recipients]
+                    snap["snapshot"] = [(u["chat_id"], u["deposit"]) for u in recipients]
+                used_pct = 100.0 * (cum_margin / max(SYSTEM_BANK_USDT, 1e-9))
+                msg = f"🪙💵 Добор {base_from_pair(pair)}. Объём в сделке: {used_pct:.1f}% банка (≈ ${fmt_usd(cum_margin)})."
+                for uid in snap["users"]:
                     push(uid, msg)
 
-            # Закрытие сделки — распределяем премию 30%
-            if ev in ("TP_HIT", "SL_HIT", "MANUAL_CLOSE"):
+            elif ev in ("TP_HIT","SL_HIT","MANUAL_CLOSE"):
                 snap = open_positions.get(sid, {})
-                recipients = snap.get("recipients", [])
                 cm = snap.get("cum_margin", cum_margin)
-
-                if not recipients:
-                    # fallback: если по какой-то причине нет снимка — считаем по всем активным сейчас
-                    recipients = [u["chat_id"] for u in get_users() if u["active"]]
-
-                if not recipients:
-                    continue
-
-                # пул премии 30% от net PnL сделки (может быть отрицательным)
-                bonus_pool = pnl_usd * 0.30
-
-                # депозиты только тех, кто был в получателях сделки
-                users_map = {u["chat_id"]: u for u in get_users()}
-                dep_sum = sum(users_map[uid]["deposit"] for uid in recipients if uid in users_map) or 1.0
-
+                recipients_ids = snap.get("users", [])
+                snapshot = snap.get("snapshot", [])
+                if not recipients_ids:
+                    # если нет — считаем всех активных на сейчас, без распределения по истории (редкий случай)
+                    users_all = get_users()
+                    recipients = [u for u in users_all if u["active"] and u["deposit"] > 0]
+                    recipients_ids = [u["chat_id"] for u in recipients]
+                    snapshot = [(u["chat_id"], u["deposit"]) for u in recipients]
+                # 30%-модель
+                pool30 = pnl_usd * 0.30
+                profit30_total += pool30  # в State хранится сумма к выплате (30% от PnL)
+                # распределение по депо на момент OPEN
+                total_dep_snap = sum(dep for _, dep in snapshot) or 1.0
                 used_pct = 100.0 * (cm / max(SYSTEM_BANK_USDT, 1e-9))
-                profit_pct_vs_cm = (pnl_usd / max(cm, 1e-9)) * 100.0 if cm > 0 else 0.0
-                icon = "✅" if pnl_usd >= 0 else "🛑"
+                # относительная доходность на сделке (в 30%-м выражении)
+                # исходный profit_pct по марже сделки: pnl_usd / cm * 100
+                profit_pct_raw = (pnl_usd / cm * 100.0) if cm > 0 else 0.0
+                profit_pct_30 = profit_pct_raw * 0.30
 
-                # распределяем и копим Bonus_Accrued
-                for uid in recipients:
-                    u = users_map.get(uid)
-                    if not u: continue
-                    share = (u["deposit"] / dep_sum) if dep_sum > 0 else 0.0
-                    my_bonus = bonus_pool * share
-                    if abs(my_bonus) > 1e-9:
-                        adjust_user_bonus(uid, delta_acc=my_bonus)
-                    # сообщение пользователю
-                    # годовые считаем от накопленной премии (Bonus_Accrued) к его депозиту
-                    u_after = next((x for x in get_users() if x["chat_id"] == uid), u)
-                    ann_pct, ann_usd = annual_forecast_user(u_after["bonus_acc"], start_utc, u_after["deposit"])
+                # Разошлём и начислим
+                for (uid, dep_snap) in snapshot:
+                    u = next((x for x in get_users() if x["chat_id"] == uid), None)
+                    if not u:  # пользователь уже удалён
+                        continue
+                    my_bonus = pool30 * (dep_snap / total_dep_snap)
+                    # начислим премию пользователю
+                    upsert_user_row(uid, bonus_acc=u["bonus_acc"] + my_bonus)
+                    # текст
+                    ann_pct, ann_usd = annual_forecast(
+                        user_bonus_total=(u["bonus_acc"] + my_bonus),  # после начисления
+                        start_utc=start_utc,
+                        user_deposit=u["deposit"]  # текущий депозит (Ок для оценки)
+                    )
+                    icon = "🚀" if my_bonus >= 0 else "🛑"
                     txt = (
-                        f"{icon} Сделка закрыта. Использовалось {used_pct:.1f}% банка ({fmt_usd(cm)}). "
-                        f"Net P&L сделки: <b>{fmt_usd(pnl_usd)}</b> ({profit_pct_vs_cm:+.2f}%).\n"
-                        f"Ваша премия за эту сделку (30% от P&L по доле депозита): <b>{fmt_usd(my_bonus)}</b>.\n"
-                        f"Оценка годовых по вашему депозиту {fmt_usd(u_after['deposit'])}: ~{ann_pct:.1f}% (≈{fmt_usd(ann_usd)}/год)."
+                        f"{icon} Сделка закрыта по <b>{base_from_pair(pair)}</b>.\n"
+                        f"Использовалось {used_pct:.1f}% банка (≈ ${fmt_usd(cm)}).\n"
+                        f"P&L (30% пул): <b>${fmt_usd(pool30)}</b> ({profit_pct_30:+.2f}%)\n"
+                        f"Ваша премия за сделку: <b>${fmt_usd(my_bonus)}</b>\n\n"
+                        f"Оценка годовых для вашего депозита (${fmt_usd(u['deposit'])}): "
+                        f"~{ann_pct:.1f}% (≈ ${fmt_usd(ann_usd)}/год)."
                     )
                     push(uid, txt)
-
-                # агрегатор в STATE — суммируем именно 30% (для общей статистики системы)
-                profit_total += bonus_pool
-                set_state(profit_total=profit_total)
-
+                # очистим
                 if sid in open_positions:
                     del open_positions[sid]
 
-        # отправим накопившиеся сообщения
-        final_messages = {uid: "\n\n".join(msgs) for uid, msgs in per_user_msgs.items() if msgs}
-        if final_messages:
-            await send_all(app, final_messages)
-
-        set_state(last_row=total_rows_in_sheet)
+        # отправим накопленные сообщения
+        if per_user_msgs:
+            await send_all(app, {uid: "\n\n".join(msgs) for uid, msgs in per_user_msgs.items()})
+        set_state(last_row=total_rows, profit30_total=profit30_total)
     except Exception as e:
         log.exception("poll_and_broadcast error")
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     await poll_and_broadcast(context.application)
 
-# ------------------- Main -------------------
+# ------------------- post_init & main -------------------
 async def post_init(app: Application):
     await set_menu_default(app)
     await set_menu_admins(app)
+    # восстановим меню юзерам
     try:
-        users = [u for u in get_users() if u.get("active")]
-        for u in users:
-            try:
-                await set_menu_user(app, int(u["chat_id"]))
-            except Exception as e:
-                log.warning(f"set_menu_user failed for {u}: {e}")
+        for u in get_users():
+            if u.get("active"):
+                try:
+                    await set_menu_user(app, int(u["chat_id"]))
+                except Exception as e:
+                    log.warning(f"set_menu_user failed for {u}: {e}")
     except Exception as e:
-        log.warning(f"post_init: could not restore user menus: {e}")
+        log.warning(f"post_init restore menus failed: {e}")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    handlers = [
-        # пользователи
-        CommandHandler("start", start),
-        CommandHandler("about", about),
-        CommandHandler("myname", myname),
-        CommandHandler("add_deposit", add_deposit),
-        CommandHandler("add_from_bonus", add_from_bonus),
-        CommandHandler("withdraw_bonus", withdraw_bonus),
-        CommandHandler("withdraw_all", withdraw_all),
-        CommandHandler("balance", balance),
-        # админ
-        CommandHandler("help", help_cmd),
-        CommandHandler("adduser", adduser),
-        CommandHandler("setdep", setdep),
-        CommandHandler("setname", setname),
-        CommandHandler("remove", remove),
-        CommandHandler("list", list_users),
-    ]
-    for h in handlers: app.add_handler(h)
+    # user
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("about", about))
+    app.add_handler(CommandHandler("myname", myname))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("add_deposit", add_deposit))
+    app.add_handler(CommandHandler("add_from_bonus", add_from_bonus))
+    app.add_handler(CommandHandler("withdraw_bonus", withdraw_bonus))
+    app.add_handler(CommandHandler("withdraw_all", withdraw_all))
+    app.add_handler(CommandHandler("mywallet", mywallet))
+    app.add_handler(CommandHandler("setwallet", setwallet))
+    app.add_handler(CommandHandler("clearwallet", clearwallet))
+    # admin
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("adduser", adduser))
+    app.add_handler(CommandHandler("setdep", setdep))
+    app.add_handler(CommandHandler("setname", setname_admin))
+    app.add_handler(CommandHandler("remove", remove))
+    app.add_handler(CommandHandler("list", list_users))
+    app.add_handler(CommandHandler("approve_wallet", approve_wallet))
+    app.add_handler(CommandHandler("reject_wallet", reject_wallet))
+    app.add_handler(CommandHandler("apply_from_bonus", apply_from_bonus))
+    app.add_handler(CommandHandler("pay_bonus", pay_bonus))
+    app.add_handler(CommandHandler("pay_all", pay_all))
+
+    # poller
     app.job_queue.run_repeating(poll_job, interval=10, first=5)
     log.info(f"{BOT_NAME} starting…")
     app.run_polling()
